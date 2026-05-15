@@ -4,6 +4,8 @@ This document is the run reference for actual experiments.
 
 Environment bootstrap and dataset staging are intentionally not repeated here. Do those first using [SETUP.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/SETUP.md) and [DATASET_SETUP.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/DATASET_SETUP.md).
 
+For the one-GPU Slurm workflow, use [REMOTE_DATA_PIPELINE.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/REMOTE_DATA_PIPELINE.md). It defines the bounded source download, open-VLM filtering, manifest splits, and Slurm job order.
+
 ## Preflight
 
 Before launching a real run, validate the repo-local pipeline:
@@ -235,6 +237,19 @@ bash scripts/run_generation_sanity_suite.sh \
 
 ### Select source images before self-evolve
 
+One-command remote preparation:
+
+```bash
+bash scripts/prepare_remote_data.sh \
+  --stage all \
+  --download-limit 20000 \
+  --filter-limit 20000 \
+  --max-selected 5000 \
+  --pilot-count 128 \
+  --main-count 1024 \
+  --heldout-count 128
+```
+
 Open-VLM filtering:
 
 ```bash
@@ -250,6 +265,17 @@ python -m qwen_edit_project.data.select_unlabeled_images \
   --config configs/data/source_image_filter_heuristic.yaml \
   --set input.images_dir=data/unlabeled/raw \
   --limit 128
+```
+
+Split selected images into pilot/main/heldout manifests:
+
+```bash
+python -m qwen_edit_project.data.split_source_manifest \
+  --input data/unlabeled/selected/coco2017/manifest.jsonl \
+  --output-dir data/unlabeled/splits/coco2017 \
+  --pilot-count 128 \
+  --main-count 1024 \
+  --heldout-count 128
 ```
 
 ### Fresh hybrid run

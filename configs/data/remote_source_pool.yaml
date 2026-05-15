@@ -1,0 +1,28 @@
+name: remote_source_pool_coco2017
+runtime:
+  seed: 123
+dataset:
+  path: regisss/coco_2017
+  name: null
+  split: train
+  streaming: true
+  trust_remote_code: false
+  cache_dir: null
+  image_column: image
+  caption_column: caption
+  id_column: image_id
+  shuffle_buffer: 10000
+  skip: 0
+  limit: 20000
+filters:
+  min_short_side: 384
+  max_aspect_ratio: 2.8
+output:
+  images_dir: data/unlabeled/raw/coco2017
+  metadata_jsonl: data/unlabeled/raw/coco2017_metadata.jsonl
+  summary_json: data/unlabeled/raw/coco2017_download_summary.json
+  image_format: jpg
+  quality: 92
+  max_long_side: 1536
+  resume: true
+  progress_every: 250

@@ -30,6 +30,7 @@ Benchmark scope notes:
 - [scripts](/Users/ritesh.thawkar/Ritesh/neurips-project/scripts): shell entry points
 - [docs](/Users/ritesh.thawkar/Ritesh/neurips-project/docs): setup and runbook docs
 - [docs/DATASET_SETUP.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/DATASET_SETUP.md): dataset and asset preparation for training, self-evolve, and benchmarks
+- [docs/REMOTE_DATA_PIPELINE.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/REMOTE_DATA_PIPELINE.md): one-GPU Slurm data staging and source-pool splitting
 - [docs/SOURCE_IMAGE_SELECTION.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/SOURCE_IMAGE_SELECTION.md): open-VLM filtering for self-evolve source images
 - [docs/EXPERIMENTS.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/EXPERIMENTS.md): experiment commands, output contract, and resume patterns
 - [docs/SELF_EVOLVE.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/SELF_EVOLVE.md): self-evolving loop details
@@ -78,6 +79,7 @@ bash scripts/export_geneval.sh --limit 8
 
 ```bash
 bash scripts/select_unlabeled_images.sh --set vlm.backend=heuristic
+python -m qwen_edit_project.data.split_source_manifest --input data/unlabeled/selected/manifest.jsonl --output-dir data/unlabeled/splits/local
 bash scripts/self_evolve_pillow_demo.sh --limit 8
 bash scripts/self_evolve_2509_hybrid.sh --limit 32
 ```

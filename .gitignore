@@ -16,7 +16,11 @@ third_party/*
 
 data/raw/*
 !data/raw/.gitkeep
+data/manifests/*
+!data/manifests/.gitkeep
 data/unlabeled/*
+data/external/*
+!data/external/.gitkeep
 data/processed/*
 !data/processed/train/
 !data/processed/val/

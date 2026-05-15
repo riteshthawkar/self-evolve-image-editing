@@ -20,8 +20,11 @@ Follow [docs/DATASET_SETUP.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs
 
 - supervised finetuning manifest setup
 - unlabeled self-evolve image pool setup
+- bounded remote source-pool download/filter/split setup
 - ImgEdit local assets
 - GenEval detector assets
+
+For the Slurm single-GPU workflow, use [docs/REMOTE_DATA_PIPELINE.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/REMOTE_DATA_PIPELINE.md).
 
 ## Experiment operations
 
@@ -45,9 +48,9 @@ pip install -e .
 Training-oriented environment:
 
 ```bash
-pip install -e .
+pip install -e ".[vlm]"
 pip install -e third_party/diffsynth-studio
-pip install accelerate transformers diffusers pillow
+pip install accelerate transformers diffusers pillow datasets
 ```
 
 For AMD GPUs, install a ROCm-enabled PyTorch build first using the official PyTorch selector.

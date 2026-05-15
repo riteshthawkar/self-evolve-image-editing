@@ -178,6 +178,18 @@ bash scripts/run_self_evolve_matrix.sh \
 
 See [SOURCE_IMAGE_SELECTION.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/SOURCE_IMAGE_SELECTION.md) for the full filtering pipeline.
 
+For remote data preparation on the single-GPU Slurm machine, use the bounded download/filter/split pipeline:
+
+```bash
+bash scripts/prepare_remote_data.sh \
+  --stage all \
+  --download-limit 20000 \
+  --filter-limit 20000 \
+  --max-selected 5000
+```
+
+This writes raw images, VLM-filtered selected manifests, and pilot/main/heldout splits under `data/unlabeled/`. See [REMOTE_DATA_PIPELINE.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/REMOTE_DATA_PIPELINE.md).
+
 ## 3. Edit benchmark assets
 
 ### GEdit-Bench
@@ -291,6 +303,8 @@ bash scripts/run_self_evolve_matrix.sh --variant all --limit 32 --images-dir dat
 - `third_party/` bootstrapped
 - editable package installed
 - `data/manifests/train_metadata_qwen_edit.json` exists and validates
+- `data/unlabeled/splits/<source>/pilot_manifest.jsonl` exists before pilot self-evolve
+- `data/unlabeled/splits/<source>/main_manifest.jsonl` exists before main self-evolve
 - `data/unlabeled/self_evolve/` exists for self-evolve runs
 - `data/processed/benchmark/imgedit/` populated for ImgEdit
 - `data/external/geneval_detector/` populated for GenEval scoring

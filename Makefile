@@ -1,6 +1,6 @@
 PYTHON ?= python
 
-.PHONY: bootstrap select-unlabeled-images train-lora train-full validate-lora validate-full \
+.PHONY: bootstrap prepare-remote-data select-unlabeled-images train-lora train-full validate-lora validate-full \
 		export-gedit score-gedit export-imgedit score-imgedit \
 		export-geneval score-geneval export-dpgbench score-dpgbench \
 		export-oneig-bench score-oneig-bench \
@@ -9,6 +9,9 @@ PYTHON ?= python
 
 bootstrap:
 	bash scripts/bootstrap.sh
+
+prepare-remote-data:
+	bash scripts/prepare_remote_data.sh $(ARGS)
 
 select-unlabeled-images:
 	bash scripts/select_unlabeled_images.sh $(ARGS)

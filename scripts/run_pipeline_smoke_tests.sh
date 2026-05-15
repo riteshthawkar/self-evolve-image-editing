@@ -54,6 +54,7 @@ echo "[1/6] Compile Python sources"
 
 echo "[2/6] Check shell syntax"
 bash -n scripts/*.sh
+find scripts/slurm -name '*.sbatch' -print0 | xargs -0 -n1 bash -n
 
 echo "[3/6] Dry-run edit suite commands"
 bash scripts/run_edit_model_suite.sh --model-type base --dry-run --limit 2
@@ -97,6 +98,13 @@ echo "[6/6] Run lightweight source-selection and self-evolve smoke path"
   --set selection.thresholds.min_editable_content=0.10 \
   --set selection.thresholds.min_preservation_potential=0.10 \
   --limit 3
+
+"${PYTHON:-python3}" -m qwen_edit_project.data.split_source_manifest \
+  --input "$TMP_OUTPUT/selected/manifest.jsonl" \
+  --output-dir "$TMP_OUTPUT/splits" \
+  --pilot-count 1 \
+  --main-count 1 \
+  --heldout-count 1
 
 bash scripts/run_self_evolve_matrix.sh \
   --variant hybrid \
