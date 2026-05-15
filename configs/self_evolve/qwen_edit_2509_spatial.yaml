@@ -1,0 +1,58 @@
+name: self_evolve_qwen_edit_2509_spatial
+runtime:
+  seed: 123
+  dry_run: false
+dataset:
+  source: directory
+  images_dir: data/unlabeled/self_evolve
+  metadata_jsonl: null
+  limit: null
+proposer:
+  backend: scripted
+  families:
+    - exposure
+    - color
+    - contrast
+    - tone
+    - style
+editor:
+  backend: qwen_edit
+  device: auto
+  generation:
+    seed: 42
+    num_inference_steps: 28
+    true_cfg_scale: 4.0
+    guidance_scale: 1.0
+    negative_prompt: " "
+  model:
+    model_type: base
+    checkpoint_path: null
+    processor_model_id: Qwen/Qwen-Image-Edit
+    torch_dtype: auto
+    model_id_with_origin_paths: Qwen/Qwen-Image-Edit-2509:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors
+solver:
+  backend: hybrid
+  global_weight: 0.7
+  local_weight: 0.3
+  proxy_weight: 0.8
+  spatial_weight: 0.2
+  cycle_weight: 0.0
+  internal_weight: 0.0
+  acceptance_threshold: 0.72
+curriculum:
+  num_rounds: 3
+  proposals_per_image: 1
+  initial_level: 1
+  min_level: 1
+  max_level: 3
+  promote_at: 0.75
+  demote_at: 0.45
+  max_records_per_round: 256
+training:
+  trigger: emit_only
+  base_train_config: configs/train/lora_2509.yaml
+  current_checkpoint_path: null
+output:
+  root_dir: outputs/self_evolve/qwen_edit_2509_spatial
+  save_all_candidates: false
+  use_cumulative_manifest: true

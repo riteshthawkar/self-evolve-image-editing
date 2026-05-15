@@ -1,0 +1,58 @@
+name: self_evolve_pillow_delta_ranker
+runtime:
+  seed: 123
+  dry_run: false
+dataset:
+  source: directory
+  images_dir: data/unlabeled/demo
+  metadata_jsonl: null
+  limit: null
+proposer:
+  backend: scripted
+  families: []
+editor:
+  backend: pillow_demo
+  device: auto
+  generation: {}
+  model: {}
+candidate_generation:
+  samples_per_proposal: 4
+  seed_stride: 7919
+solver:
+  backend: hard_gated_relative
+  global_weight: 0.7
+  local_weight: 0.3
+  proxy_weight: 0.60
+  spatial_weight: 0.30
+  cycle_weight: 0.10
+  internal_weight: 0.0
+  acceptance_threshold: 0.72
+  instruction_threshold: 0.60
+  preservation_threshold: 0.55
+  quality_threshold: 0.45
+  max_disagreement: 0.40
+  top_m: 1
+  counterfactual_distractors: 3
+  rank_spatial_weight: 0.40
+  rank_counterfactual_weight: 0.30
+  rank_relative_weight: 0.25
+  rank_cycle_weight: 0.05
+  rank_internal_weight: 0.00
+curriculum:
+  num_rounds: 3
+  proposals_per_image: 2
+  initial_level: 1
+  min_level: 1
+  max_level: 3
+  promote_at: 0.75
+  demote_at: 0.45
+  max_records_per_round: 64
+training:
+  trigger: emit_only
+  base_train_config: configs/train/lora_2509.yaml
+  current_checkpoint_path: null
+output:
+  root_dir: outputs/self_evolve/pillow_delta_ranker
+  save_all_candidates: true
+  use_cumulative_manifest: true
+  write_evaluator_training: true

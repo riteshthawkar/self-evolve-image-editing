@@ -1,0 +1,22 @@
+diff --git a/scripts/diversity/diversity_score.py b/scripts/diversity/diversity_score.py
+index 5451cb8..44fa4a1 100644
+--- a/scripts/diversity/diversity_score.py
++++ b/scripts/diversity/diversity_score.py
+@@ -14,7 +14,7 @@ import torchvision
+ torchvision.disable_beta_transforms_warning()
+ from dreamsim import dreamsim
+ import datetime
+ current_time = datetime.datetime.now()
+ formatted_time = current_time.strftime("%Y-%m-%d_%H-%M-%S")
+-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
++os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+ device = "cuda"
+ model, preprocess = dreamsim(pretrained=True, device=device)
+@@ -36,7 +36,7 @@ def main():
+     diversity_score_csv = f"results/diversity_score_{args.mode}_{formatted_time}.csv"
+     diversity_prompt_score_csv = f"results/diversity_prompt_score_{args.mode}_{formatted_time}.csv"
+     os.makedirs(os.path.dirname(diversity_score_csv), exist_ok=True)
+-    column_items = args.class_items.copy().append("total average")
++    column_items = args.class_items.copy() + ["total average"]
+     score_csv = pd.DataFrame(index=args.model_names, columns=column_items)
+     score_of_prompt_csv = pd.DataFrame(columns=args.model_names)

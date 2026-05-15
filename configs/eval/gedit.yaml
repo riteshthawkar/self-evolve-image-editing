@@ -1,0 +1,37 @@
+name: qwen_edit_2509_base
+benchmark: gedit
+runtime:
+  python_executable: python
+  env_file: configs/env/eval.env.example
+  dry_run: false
+  log_dir: outputs/logs
+model:
+  model_type: base
+  base_model: Qwen/Qwen-Image-Edit-2509
+  checkpoint_path: null
+  model_name: qwen_edit_2509_base
+  torch_dtype: auto
+  model_id_with_origin_paths: Qwen/Qwen-Image-Edit-2509:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors
+dataset:
+  source: huggingface
+  dataset_name: stepfun-ai/GEdit-Bench
+  split: train
+  local_path: null
+  instruction_language: all
+  task_type: all
+generation:
+  seed: 42
+  num_inference_steps: 28
+  true_cfg_scale: 4.0
+  guidance_scale: 1.0
+  negative_prompt: " "
+output:
+  edited_images_dir: outputs/benchmark_images/gedit
+  scores_dir: outputs/scores/gedit
+  summary_path: outputs/scores/gedit/qwen_edit_2509_base_summary.json
+scoring:
+  backbone: gpt4o
+  save_dir: outputs/scores/gedit
+  scorer_secret_env_path: secret.env
+prompting:
+  use_prompt_polish: false

@@ -1,0 +1,35 @@
+name: source_image_filter_heuristic
+input:
+  source: directory
+  images_dir: data/unlabeled/raw
+vlm:
+  backend: heuristic
+selection:
+  max_selected: 5000
+  min_average_hash_distance: 6
+  max_family_fraction: 0.45
+  thresholds:
+    min_short_side: 384
+    max_aspect_ratio: 2.5
+    min_technical_quality: 0.30
+    min_editable_content: 0.30
+    min_preservation_potential: 0.25
+    min_edit_families: 1
+    min_total_score: 0.35
+  weights:
+    technical_quality: 0.25
+    vlm_quality: 0.15
+    natural_image: 0.05
+    editable_content: 0.20
+    object_region_clarity: 0.15
+    preservation_potential: 0.15
+    edit_family_coverage: 0.10
+    clutter_penalty: 0.08
+    text_watermark_penalty: 0.12
+output:
+  selected_manifest_jsonl: data/unlabeled/selected/manifest.jsonl
+  rejected_manifest_jsonl: data/unlabeled/selected/rejected.jsonl
+  score_jsonl: data/unlabeled/selected/scores.jsonl
+  summary_json: data/unlabeled/selected/selection_summary.json
+  materialize_mode: none
+  selected_images_dir: data/unlabeled/selected/images

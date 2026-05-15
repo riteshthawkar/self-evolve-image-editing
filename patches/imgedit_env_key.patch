@@ -1,0 +1,21 @@
+diff --git a/Benchmark/Basic/basic_bench.py b/Benchmark/Basic/basic_bench.py
+index 31d8ad6..72d6f50 100644
+--- a/Benchmark/Basic/basic_bench.py
++++ b/Benchmark/Basic/basic_bench.py
+@@ -24,10 +24,14 @@ def call_gpt(original_image_path, result_image_path, edit_prompt, edit_type, pro
+         if not original_image_base64 or not result_image_base64:
+             return {"error": "Image conversion failed"}
+ 
++        api_key = os.environ.get("OPENAI_API_KEY")
++        base_url = os.environ.get("OPENAI_BASE_URL") or None
++        if not api_key:
++            raise RuntimeError("OPENAI_API_KEY is required for ImgEdit basic_bench.py")
++
+         client = OpenAI(
+-            api_key="api-key",
+-            base_url="url"
++            api_key=api_key,
++            base_url=base_url,
+         )
+ 
+         prompt = prompts[edit_type]

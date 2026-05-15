@@ -1,0 +1,39 @@
+name: self_evolve_pillow_demo
+runtime:
+  seed: 123
+  dry_run: false
+dataset:
+  source: directory
+  images_dir: data/unlabeled/demo
+  metadata_jsonl: null
+  limit: null
+proposer:
+  backend: scripted
+  families: []
+editor:
+  backend: pillow_demo
+  device: auto
+  generation: {}
+  model: {}
+solver:
+  backend: stat
+  global_weight: 0.7
+  local_weight: 0.3
+  acceptance_threshold: 0.72
+curriculum:
+  num_rounds: 3
+  proposals_per_image: 2
+  initial_level: 1
+  min_level: 1
+  max_level: 3
+  promote_at: 0.75
+  demote_at: 0.45
+  max_records_per_round: 64
+training:
+  trigger: emit_only
+  base_train_config: configs/train/lora_2509.yaml
+  current_checkpoint_path: null
+output:
+  root_dir: outputs/self_evolve/pillow_demo
+  save_all_candidates: true
+  use_cumulative_manifest: true

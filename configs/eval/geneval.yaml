@@ -1,0 +1,39 @@
+name: qwen_image_base
+benchmark: geneval
+runtime:
+  python_executable: python
+  env_file: configs/env/eval.env.example
+  dry_run: false
+  log_dir: outputs/logs
+model:
+  model_type: base
+  base_model: Qwen/Qwen-Image
+  checkpoint_path: null
+  model_name: qwen_image_base
+  tokenizer_model_id: Qwen/Qwen-Image
+  torch_dtype: auto
+  model_id_with_origin_paths: Qwen/Qwen-Image:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors
+dataset:
+  metadata_jsonl: third_party/geneval/prompts/evaluation_metadata.jsonl
+generation:
+  width: 1024
+  height: 1024
+  seed: 42
+  seed_stride: 1000
+  samples_per_prompt: 4
+  grid_rows: 2
+  grid_cols: 2
+  num_inference_steps: 50
+  true_cfg_scale: null
+  guidance_scale: null
+  negative_prompt: " "
+  fill_with_black_on_error: false
+output:
+  image_root: outputs/benchmark_images/geneval
+  scores_dir: outputs/scores/geneval
+  summary_path: outputs/scores/geneval/qwen_image_base_summary.json
+scoring:
+  repo_path: third_party/geneval
+  object_detector_root: data/external/geneval_detector
+  model_config: null
+  options: []
