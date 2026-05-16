@@ -9,6 +9,8 @@ vlm:
   torch_dtype: bfloat16
   max_new_tokens: 192
   temperature: 0.0
+  padding_side: left
+  processor_max_pixels: 262144
 selection:
   max_selected: 5000
   min_average_hash_distance: 6

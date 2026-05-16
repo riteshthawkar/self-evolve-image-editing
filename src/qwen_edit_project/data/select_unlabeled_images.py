@@ -196,6 +196,7 @@ class QwenOpenVLMScorer:
         self.temperature = float(config.get("temperature", 0.0))
         self.processor_min_pixels = config.get("processor_min_pixels")
         self.processor_max_pixels = config.get("processor_max_pixels", 262144)
+        self.padding_side = config.get("padding_side", "left")
         self.model = None
         self.processor = None
 
@@ -250,6 +251,10 @@ class QwenOpenVLMScorer:
         if self.processor_max_pixels is not None:
             processor_kwargs["max_pixels"] = int(self.processor_max_pixels)
         self.processor = AutoProcessor.from_pretrained(self.model_id, **processor_kwargs)
+        if hasattr(self.processor, "tokenizer"):
+            self.processor.tokenizer.padding_side = self.padding_side
+            if self.processor.tokenizer.pad_token_id is None and self.processor.tokenizer.eos_token is not None:
+                self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
         return self.model, self.processor
 
     @staticmethod
@@ -655,6 +660,8 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
         "images_seen": len(scored),
         "selected": len(selected),
         "rejected": len(rejected),
+        "accepted_before_diversity": sum(1 for item in scored if item.get("accepted")),
+        "invalid_vlm_json": sum(1 for item in scored if "invalid_vlm_json" in item.get("reject_reasons", [])),
         "selected_manifest_jsonl": str(selected_manifest),
         "rejected_manifest_jsonl": str(rejected_manifest),
         "score_jsonl": str(score_jsonl),
