@@ -183,6 +183,9 @@ class HeuristicVLMScorer:
             reject_reasons=reject_reasons,
         )
 
+    def score_batch(self, image_paths: list[Path], stats_batch: list[ImageStats]) -> list[VLMJudgment]:
+        return [self.score(image_path, stats) for image_path, stats in zip(image_paths, stats_batch)]
+
 
 class QwenOpenVLMScorer:
     def __init__(self, config: dict[str, Any]):
@@ -191,6 +194,8 @@ class QwenOpenVLMScorer:
         self.torch_dtype = config.get("torch_dtype", "auto")
         self.max_new_tokens = int(config.get("max_new_tokens", 512))
         self.temperature = float(config.get("temperature", 0.0))
+        self.processor_min_pixels = config.get("processor_min_pixels")
+        self.processor_max_pixels = config.get("processor_max_pixels", 262144)
         self.model = None
         self.processor = None
 
@@ -216,12 +221,18 @@ class QwenOpenVLMScorer:
         model_id_lower = self.model_id.lower()
         if "qwen3-vl" in model_id_lower:
             try:
-                from transformers import Qwen3VLForConditionalGeneration
+                if any(marker in model_id_lower for marker in ("a3b", "a22b", "moe")):
+                    from transformers import Qwen3VLMoeForConditionalGeneration
 
-                self.model = Qwen3VLForConditionalGeneration.from_pretrained(self.model_id, **load_kwargs)
+                    self.model = Qwen3VLMoeForConditionalGeneration.from_pretrained(self.model_id, **load_kwargs)
+                else:
+                    from transformers import Qwen3VLForConditionalGeneration
+
+                    self.model = Qwen3VLForConditionalGeneration.from_pretrained(self.model_id, **load_kwargs)
             except ImportError as exc:
                 raise ImportError(
-                    "Qwen3-VL requires a recent transformers build with Qwen3VLForConditionalGeneration. "
+                    "Qwen3-VL requires a recent transformers build with Qwen3VLForConditionalGeneration "
+                    "or Qwen3VLMoeForConditionalGeneration. "
                     "Upgrade with: pip install --upgrade transformers accelerate qwen-vl-utils"
                 ) from exc
         else:
@@ -233,7 +244,12 @@ class QwenOpenVLMScorer:
                 from transformers import AutoModelForImageTextToText
 
                 self.model = AutoModelForImageTextToText.from_pretrained(self.model_id, **load_kwargs)
-        self.processor = AutoProcessor.from_pretrained(self.model_id)
+        processor_kwargs = {}
+        if self.processor_min_pixels is not None:
+            processor_kwargs["min_pixels"] = int(self.processor_min_pixels)
+        if self.processor_max_pixels is not None:
+            processor_kwargs["max_pixels"] = int(self.processor_max_pixels)
+        self.processor = AutoProcessor.from_pretrained(self.model_id, **processor_kwargs)
         return self.model, self.processor
 
     @staticmethod
@@ -255,30 +271,27 @@ class QwenOpenVLMScorer:
             raise ValueError(f"VLM response did not contain JSON: {text[:200]}")
         return json.loads(match.group(0))
 
-    def score(self, image_path: Path, stats: ImageStats) -> VLMJudgment:
-        model, processor = self._ensure_model()
-        with Image.open(image_path) as handle:
-            image = handle.convert("RGB")
+    @staticmethod
+    def _fallback_judgment(response: str, reason: str) -> VLMJudgment:
+        return VLMJudgment(
+            caption=None,
+            quality_score=0.0,
+            natural_image_score=0.0,
+            editable_content_score=0.0,
+            object_region_clarity=0.0,
+            preservation_potential=0.0,
+            clutter_penalty=1.0,
+            text_watermark_penalty=1.0,
+            edit_families=[],
+            reject_reasons=[reason],
+            raw_response=response,
+        )
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": self._prompt()},
-                ],
-            }
-        ]
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(text=[text], images=[image], return_tensors="pt")
-        inputs = inputs.to(model.device)
-        generate_kwargs = {"max_new_tokens": self.max_new_tokens}
-        if self.temperature > 0.0:
-            generate_kwargs.update({"do_sample": True, "temperature": self.temperature})
-        generated_ids = model.generate(**inputs, **generate_kwargs)
-        trimmed = [output_ids[len(input_ids) :] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)]
-        response = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        data = self._parse_json(response)
+    def _judgment_from_response(self, response: str) -> VLMJudgment:
+        try:
+            data = self._parse_json(response)
+        except Exception:
+            return self._fallback_judgment(response, "invalid_vlm_json")
         edit_families = [str(item) for item in data.get("edit_families", []) if str(item) in EDIT_FAMILIES]
         return VLMJudgment(
             caption=data.get("caption"),
@@ -293,6 +306,38 @@ class QwenOpenVLMScorer:
             reject_reasons=[str(item) for item in data.get("reject_reasons", [])],
             raw_response=response,
         )
+
+    def score_batch(self, image_paths: list[Path], stats_batch: list[ImageStats]) -> list[VLMJudgment]:
+        model, processor = self._ensure_model()
+        images = []
+        texts = []
+        for image_path in image_paths:
+            with Image.open(image_path) as handle:
+                image = handle.convert("RGB")
+            images.append(image)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": self._prompt()},
+                    ],
+                }
+            ]
+            texts.append(processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+
+        inputs = processor(text=texts, images=images, padding=True, return_tensors="pt")
+        inputs = inputs.to(model.device)
+        generate_kwargs = {"max_new_tokens": self.max_new_tokens}
+        if self.temperature > 0.0:
+            generate_kwargs.update({"do_sample": True, "temperature": self.temperature})
+        generated_ids = model.generate(**inputs, **generate_kwargs)
+        trimmed = [output_ids[len(input_ids) :] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)]
+        responses = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return [self._judgment_from_response(response) for response in responses]
+
+    def score(self, image_path: Path, stats: ImageStats) -> VLMJudgment:
+        return self.score_batch([image_path], [stats])[0]
 
 
 def build_vlm_scorer(config: dict[str, Any]):
@@ -484,6 +529,7 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
     resume_scored = bool(selection_cfg.get("resume_scored", True))
     stream_scores = bool(selection_cfg.get("stream_scores", True))
     progress_every = int(selection_cfg.get("progress_every", 10))
+    batch_size = max(1, int(selection_cfg.get("batch_size", 1)))
     weights = selection_cfg.get(
         "weights",
         {
@@ -509,39 +555,51 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
     score_handle = score_jsonl.open("a", encoding="utf-8") if stream_scores else None
     started_at = time.time()
     try:
-        for index, image_path in enumerate(image_paths, start=1):
-            image_rel = relative_to_repo(image_path)
-            if image_rel in scored_by_image:
-                continue
-            stats = compute_image_stats(image_path)
-            stats_scores = _stats_to_scores(stats)
-            vlm = scorer.score(image_path, stats)
-            score = combine_score(stats_scores, vlm, weights)
-            item = {
-                "key": image_key(image_path, images_dir),
-                "image": image_rel,
-                "caption": vlm.caption,
-                "score": score,
-                "edit_families": vlm.edit_families,
-                "primary_family": vlm.edit_families[0] if vlm.edit_families else "unknown",
-                "stats": _asdict_stats(stats),
-                "stats_scores": stats_scores,
-                "vlm": _asdict_vlm(vlm),
-            }
-            item = apply_thresholds(item, thresholds)
-            scored.append(item)
-            scored_by_image[image_rel] = item
-            if score_handle is not None:
-                score_handle.write(json.dumps(item, ensure_ascii=True) + "\n")
-                score_handle.flush()
-            if progress_every > 0 and len(scored) % progress_every == 0:
-                elapsed = max(time.time() - started_at, 1e-6)
-                rate = len(scored) / elapsed
+        pending_paths = [image_path for image_path in image_paths if relative_to_repo(image_path) not in scored_by_image]
+        for start in range(0, len(pending_paths), batch_size):
+            batch_paths = pending_paths[start : start + batch_size]
+            batch_stats = [compute_image_stats(image_path) for image_path in batch_paths]
+            batch_stats_scores = [_stats_to_scores(stats) for stats in batch_stats]
+            try:
+                batch_vlm = scorer.score_batch(batch_paths, batch_stats)
+            except RuntimeError as exc:
+                if len(batch_paths) == 1:
+                    raise
                 print(
-                    f"Scored {len(scored)} / {len(image_paths)} images "
-                    f"({rate:.2f} img/s, latest_score={score:.3f}, accepted={item['accepted']})",
+                    f"Batch of {len(batch_paths)} failed with {exc.__class__.__name__}; retrying one image at a time.",
                     flush=True,
                 )
+                batch_vlm = [scorer.score(image_path, stats) for image_path, stats in zip(batch_paths, batch_stats)]
+            for image_path, stats, stats_scores, vlm in zip(batch_paths, batch_stats, batch_stats_scores, batch_vlm):
+                image_rel = relative_to_repo(image_path)
+                score = combine_score(stats_scores, vlm, weights)
+                item = {
+                    "key": image_key(image_path, images_dir),
+                    "image": image_rel,
+                    "caption": vlm.caption,
+                    "score": score,
+                    "edit_families": vlm.edit_families,
+                    "primary_family": vlm.edit_families[0] if vlm.edit_families else "unknown",
+                    "stats": _asdict_stats(stats),
+                    "stats_scores": stats_scores,
+                    "vlm": _asdict_vlm(vlm),
+                }
+                item = apply_thresholds(item, thresholds)
+                scored.append(item)
+                scored_by_image[image_rel] = item
+                if score_handle is not None:
+                    score_handle.write(json.dumps(item, ensure_ascii=True) + "\n")
+                if progress_every > 0 and len(scored) % progress_every == 0:
+                    elapsed = max(time.time() - started_at, 1e-6)
+                    rate = len(scored) / elapsed
+                    print(
+                        f"Scored {len(scored)} / {len(image_paths)} images "
+                        f"({rate:.2f} img/s, latest_score={score:.3f}, accepted={item['accepted']}, "
+                        f"batch_size={len(batch_paths)})",
+                        flush=True,
+                    )
+            if score_handle is not None:
+                score_handle.flush()
     finally:
         if score_handle is not None:
             score_handle.close()

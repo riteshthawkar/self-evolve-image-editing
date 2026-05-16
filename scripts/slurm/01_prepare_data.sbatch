@@ -23,6 +23,8 @@ FILTER_LIMIT="${FILTER_LIMIT:-$DOWNLOAD_LIMIT}"
 MAX_SELECTED="${MAX_SELECTED:-5000}"
 VLM_BACKEND="${VLM_BACKEND:-qwen_vl}"
 VLM_MODEL_ID="${VLM_MODEL_ID:-Qwen/Qwen3-VL-8B-Instruct}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+VLM_PROCESSOR_MAX_PIXELS="${VLM_PROCESSOR_MAX_PIXELS:-262144}"
 
 bash scripts/prepare_remote_data.sh \
   --stage all \
@@ -31,6 +33,8 @@ bash scripts/prepare_remote_data.sh \
   --max-selected "$MAX_SELECTED" \
   --vlm-backend "$VLM_BACKEND" \
   --vlm-model-id "$VLM_MODEL_ID" \
+  --batch-size "$BATCH_SIZE" \
+  --vlm-processor-max-pixels "$VLM_PROCESSOR_MAX_PIXELS" \
   --pilot-count "${PILOT_COUNT:-128}" \
   --main-count "${MAIN_COUNT:-1024}" \
   --heldout-count "${HELDOUT_COUNT:-128}" \

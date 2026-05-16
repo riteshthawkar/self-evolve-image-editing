@@ -71,6 +71,17 @@ bash scripts/select_unlabeled_images.sh \
   --set input.images_dir=/path/to/raw/images
 ```
 
+On H200, use batched VLM filtering:
+
+```bash
+bash scripts/select_unlabeled_images.sh \
+  --set selection.batch_size=8 \
+  --set vlm.processor_max_pixels=262144 \
+  --set vlm.max_new_tokens=192
+```
+
+Increase `selection.batch_size` to `16` if GPU memory is comfortable. If you switch to `Qwen/Qwen3-VL-30B-A3B-Instruct`, start with batch size `2` or `4`.
+
 If GPU memory is tight:
 
 ```bash
@@ -84,6 +95,14 @@ To reproduce the older filtering baseline, override the model:
 ```bash
 bash scripts/select_unlabeled_images.sh \
   --set vlm.model_id=Qwen/Qwen2.5-VL-7B-Instruct
+```
+
+To use the Qwen3-VL MoE judge on H200:
+
+```bash
+bash scripts/select_unlabeled_images.sh \
+  --set vlm.model_id=Qwen/Qwen3-VL-30B-A3B-Instruct \
+  --set selection.batch_size=4
 ```
 
 ## Heuristic Backend

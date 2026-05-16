@@ -29,6 +29,8 @@ Options:
   --vlm-backend NAME           qwen_vl or heuristic. Default: qwen_vl
   --vlm-model-id ID            Open VLM model ID. Default: Qwen/Qwen3-VL-8B-Instruct
   --vlm-max-new-tokens N       Max JSON output tokens from VLM. Default: 192
+  --vlm-processor-max-pixels N Max pixels passed to VLM processor. Default: 262144
+  --batch-size N               VLM batch size for filtering. Default: 8
   --progress-every N           Print filter progress every N scored images. Default: 10
   --pilot-count N              Pilot split size. Default: 128
   --main-count N               Main split size. Default: 1024
@@ -57,6 +59,8 @@ SPLIT_DIR="data/unlabeled/splits/coco2017"
 VLM_BACKEND="qwen_vl"
 VLM_MODEL_ID="Qwen/Qwen3-VL-8B-Instruct"
 VLM_MAX_NEW_TOKENS=192
+VLM_PROCESSOR_MAX_PIXELS=262144
+BATCH_SIZE=8
 PROGRESS_EVERY=10
 PILOT_COUNT=128
 MAIN_COUNT=1024
@@ -81,6 +85,8 @@ while [[ $# -gt 0 ]]; do
     --vlm-backend) VLM_BACKEND="$2"; shift ;;
     --vlm-model-id) VLM_MODEL_ID="$2"; shift ;;
     --vlm-max-new-tokens) VLM_MAX_NEW_TOKENS="$2"; shift ;;
+    --vlm-processor-max-pixels) VLM_PROCESSOR_MAX_PIXELS="$2"; shift ;;
+    --batch-size) BATCH_SIZE="$2"; shift ;;
     --progress-every) PROGRESS_EVERY="$2"; shift ;;
     --pilot-count) PILOT_COUNT="$2"; shift ;;
     --main-count) MAIN_COUNT="$2"; shift ;;
@@ -133,7 +139,9 @@ run_filter() {
     --set "vlm.backend=$VLM_BACKEND" \
     --set "vlm.model_id=$VLM_MODEL_ID" \
     --set "vlm.max_new_tokens=$VLM_MAX_NEW_TOKENS" \
+    --set "vlm.processor_max_pixels=$VLM_PROCESSOR_MAX_PIXELS" \
     --set "selection.max_selected=$MAX_SELECTED" \
+    --set "selection.batch_size=$BATCH_SIZE" \
     --set "selection.progress_every=$PROGRESS_EVERY" \
     --set "output.selected_manifest_jsonl=$SELECTED_DIR/manifest.jsonl" \
     --set "output.rejected_manifest_jsonl=$SELECTED_DIR/rejected.jsonl" \

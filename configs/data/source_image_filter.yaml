@@ -13,6 +13,7 @@ selection:
   max_selected: 5000
   min_average_hash_distance: 6
   max_family_fraction: 0.45
+  batch_size: 8
   progress_every: 10
   resume_scored: true
   stream_scores: true

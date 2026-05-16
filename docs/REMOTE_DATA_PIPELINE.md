@@ -23,6 +23,7 @@ Why this is resource-aware:
 
 The default config uses `regisss/coco_2017` from Hugging Face because it provides natural images with captions and stable image IDs.
 The default VLM filter is `Qwen/Qwen3-VL-8B-Instruct`. On an H200, use BF16 unless the cluster PyTorch build requires FP16.
+Filtering uses batched VLM inference by default. For H200, start with `BATCH_SIZE=8`, increase to `16` if memory is stable, and drop to `2` or `4` for `Qwen/Qwen3-VL-30B-A3B-Instruct`.
 
 Config:
 
