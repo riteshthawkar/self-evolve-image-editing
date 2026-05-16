@@ -5,6 +5,7 @@ import json
 import math
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -394,6 +395,13 @@ def write_jsonl(items: list[dict[str, Any]], path: Path) -> None:
             handle.write(json.dumps(item, ensure_ascii=True) + "\n")
 
 
+def read_jsonl_if_exists(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
 def _materialize_selected(selected: list[dict[str, Any]], output_cfg: dict[str, Any]) -> None:
     mode = output_cfg.get("materialize_mode", "none")
     if mode == "none":
@@ -425,6 +433,17 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
     scorer = build_vlm_scorer(config.get("vlm", {}))
     selection_cfg = config.get("selection", {})
     thresholds = selection_cfg.get("thresholds", {})
+    output_cfg = config["output"]
+    selected_manifest = resolve_path(output_cfg["selected_manifest_jsonl"])
+    rejected_manifest = resolve_path(output_cfg["rejected_manifest_jsonl"])
+    score_jsonl = resolve_path(output_cfg["score_jsonl"])
+    summary_path = resolve_path(output_cfg["summary_json"])
+    if selected_manifest is None or rejected_manifest is None or score_jsonl is None or summary_path is None:
+        raise ValueError("All output paths must be configured")
+    ensure_dir(score_jsonl.parent)
+    resume_scored = bool(selection_cfg.get("resume_scored", True))
+    stream_scores = bool(selection_cfg.get("stream_scores", True))
+    progress_every = int(selection_cfg.get("progress_every", 10))
     weights = selection_cfg.get(
         "weights",
         {
@@ -440,31 +459,42 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
         },
     )
 
-    scored: list[dict[str, Any]] = []
-    for image_path in image_paths:
-        stats = compute_image_stats(image_path)
-        stats_scores = _stats_to_scores(stats)
-        vlm = scorer.score(image_path, stats)
-        score = combine_score(stats_scores, vlm, weights)
-        reject_reasons = list(vlm.reject_reasons)
-        if min(stats.width, stats.height) < int(thresholds.get("min_short_side", 384)):
-            reject_reasons.append("short_side_too_small")
-        if stats.aspect_ratio > float(thresholds.get("max_aspect_ratio", 2.5)):
-            reject_reasons.append("extreme_aspect_ratio")
-        if stats_scores["technical_quality_score"] < float(thresholds.get("min_technical_quality", 0.35)):
-            reject_reasons.append("low_technical_quality")
-        if vlm.editable_content_score < float(thresholds.get("min_editable_content", 0.35)):
-            reject_reasons.append("low_editable_content")
-        if vlm.preservation_potential < float(thresholds.get("min_preservation_potential", 0.30)):
-            reject_reasons.append("low_preservation_potential")
-        if len(vlm.edit_families) < int(thresholds.get("min_edit_families", 1)):
-            reject_reasons.append("insufficient_edit_family_coverage")
-        if score < float(thresholds.get("min_total_score", 0.45)):
-            reject_reasons.append("low_total_score")
-        scored.append(
-            {
+    scored: list[dict[str, Any]] = read_jsonl_if_exists(score_jsonl) if resume_scored else []
+    scored_by_image = {str(item.get("image")): item for item in scored if item.get("image")}
+    if not resume_scored and score_jsonl.exists():
+        score_jsonl.unlink()
+    if scored:
+        print(f"Resuming source selection with {len(scored)} existing scored records from {score_jsonl}", flush=True)
+
+    score_handle = score_jsonl.open("a", encoding="utf-8") if stream_scores else None
+    started_at = time.time()
+    try:
+        for index, image_path in enumerate(image_paths, start=1):
+            image_rel = relative_to_repo(image_path)
+            if image_rel in scored_by_image:
+                continue
+            stats = compute_image_stats(image_path)
+            stats_scores = _stats_to_scores(stats)
+            vlm = scorer.score(image_path, stats)
+            score = combine_score(stats_scores, vlm, weights)
+            reject_reasons = list(vlm.reject_reasons)
+            if min(stats.width, stats.height) < int(thresholds.get("min_short_side", 384)):
+                reject_reasons.append("short_side_too_small")
+            if stats.aspect_ratio > float(thresholds.get("max_aspect_ratio", 2.5)):
+                reject_reasons.append("extreme_aspect_ratio")
+            if stats_scores["technical_quality_score"] < float(thresholds.get("min_technical_quality", 0.35)):
+                reject_reasons.append("low_technical_quality")
+            if vlm.editable_content_score < float(thresholds.get("min_editable_content", 0.35)):
+                reject_reasons.append("low_editable_content")
+            if vlm.preservation_potential < float(thresholds.get("min_preservation_potential", 0.30)):
+                reject_reasons.append("low_preservation_potential")
+            if len(vlm.edit_families) < int(thresholds.get("min_edit_families", 1)):
+                reject_reasons.append("insufficient_edit_family_coverage")
+            if score < float(thresholds.get("min_total_score", 0.45)):
+                reject_reasons.append("low_total_score")
+            item = {
                 "key": image_key(image_path, images_dir),
-                "image": relative_to_repo(image_path),
+                "image": image_rel,
                 "caption": vlm.caption,
                 "score": score,
                 "accepted": not reject_reasons,
@@ -475,7 +505,24 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
                 "stats_scores": stats_scores,
                 "vlm": _asdict_vlm(vlm),
             }
-        )
+            scored.append(item)
+            scored_by_image[image_rel] = item
+            if score_handle is not None:
+                score_handle.write(json.dumps(item, ensure_ascii=True) + "\n")
+                score_handle.flush()
+            if progress_every > 0 and len(scored) % progress_every == 0:
+                elapsed = max(time.time() - started_at, 1e-6)
+                rate = len(scored) / elapsed
+                print(
+                    f"Scored {len(scored)} / {len(image_paths)} images "
+                    f"({rate:.2f} img/s, latest_score={score:.3f}, accepted={not reject_reasons})",
+                    flush=True,
+                )
+    finally:
+        if score_handle is not None:
+            score_handle.close()
+
+    write_jsonl(scored, score_jsonl)
 
     candidates = sorted((item for item in scored if item["accepted"]), key=lambda item: item["score"], reverse=True)
     rejected = [item for item in scored if not item["accepted"]]
@@ -501,14 +548,6 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
         selected.append(item)
         selected_hashes.append(item["stats"]["average_hash"])
         family_counts[family] = family_counts.get(family, 0) + 1
-
-    output_cfg = config["output"]
-    selected_manifest = resolve_path(output_cfg["selected_manifest_jsonl"])
-    rejected_manifest = resolve_path(output_cfg["rejected_manifest_jsonl"])
-    score_jsonl = resolve_path(output_cfg["score_jsonl"])
-    summary_path = resolve_path(output_cfg["summary_json"])
-    if selected_manifest is None or rejected_manifest is None or score_jsonl is None or summary_path is None:
-        raise ValueError("All output paths must be configured")
 
     manifest_records = [
         {

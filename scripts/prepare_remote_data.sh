@@ -28,6 +28,8 @@ Options:
   --split-dir PATH             Split output directory. Default: data/unlabeled/splits/coco2017
   --vlm-backend NAME           qwen_vl or heuristic. Default: qwen_vl
   --vlm-model-id ID            Open VLM model ID. Default: Qwen/Qwen3-VL-8B-Instruct
+  --vlm-max-new-tokens N       Max JSON output tokens from VLM. Default: 192
+  --progress-every N           Print filter progress every N scored images. Default: 10
   --pilot-count N              Pilot split size. Default: 128
   --main-count N               Main split size. Default: 1024
   --heldout-count N            Heldout split size. Default: 128
@@ -54,6 +56,8 @@ SELECTED_DIR="data/unlabeled/selected/coco2017"
 SPLIT_DIR="data/unlabeled/splits/coco2017"
 VLM_BACKEND="qwen_vl"
 VLM_MODEL_ID="Qwen/Qwen3-VL-8B-Instruct"
+VLM_MAX_NEW_TOKENS=192
+PROGRESS_EVERY=10
 PILOT_COUNT=128
 MAIN_COUNT=1024
 HELDOUT_COUNT=128
@@ -76,6 +80,8 @@ while [[ $# -gt 0 ]]; do
     --split-dir) SPLIT_DIR="$2"; shift ;;
     --vlm-backend) VLM_BACKEND="$2"; shift ;;
     --vlm-model-id) VLM_MODEL_ID="$2"; shift ;;
+    --vlm-max-new-tokens) VLM_MAX_NEW_TOKENS="$2"; shift ;;
+    --progress-every) PROGRESS_EVERY="$2"; shift ;;
     --pilot-count) PILOT_COUNT="$2"; shift ;;
     --main-count) MAIN_COUNT="$2"; shift ;;
     --heldout-count) HELDOUT_COUNT="$2"; shift ;;
@@ -126,7 +132,9 @@ run_filter() {
     --set "input.images_dir=$RAW_DIR" \
     --set "vlm.backend=$VLM_BACKEND" \
     --set "vlm.model_id=$VLM_MODEL_ID" \
+    --set "vlm.max_new_tokens=$VLM_MAX_NEW_TOKENS" \
     --set "selection.max_selected=$MAX_SELECTED" \
+    --set "selection.progress_every=$PROGRESS_EVERY" \
     --set "output.selected_manifest_jsonl=$SELECTED_DIR/manifest.jsonl" \
     --set "output.rejected_manifest_jsonl=$SELECTED_DIR/rejected.jsonl" \
     --set "output.score_jsonl=$SELECTED_DIR/scores.jsonl" \

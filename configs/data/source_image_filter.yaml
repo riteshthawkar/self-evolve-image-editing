@@ -6,13 +6,16 @@ vlm:
   backend: qwen_vl
   model_id: Qwen/Qwen3-VL-8B-Instruct
   device: auto
-  torch_dtype: auto
-  max_new_tokens: 512
+  torch_dtype: bfloat16
+  max_new_tokens: 192
   temperature: 0.0
 selection:
   max_selected: 5000
   min_average_hash_distance: 6
   max_family_fraction: 0.45
+  progress_every: 10
+  resume_scored: true
+  stream_scores: true
   thresholds:
     min_short_side: 384
     max_aspect_ratio: 2.5
