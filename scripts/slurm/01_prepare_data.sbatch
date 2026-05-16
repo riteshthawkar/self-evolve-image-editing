@@ -21,8 +21,8 @@ export TOKENIZERS_PARALLELISM=false
 DOWNLOAD_LIMIT="${DOWNLOAD_LIMIT:-20000}"
 FILTER_LIMIT="${FILTER_LIMIT:-$DOWNLOAD_LIMIT}"
 MAX_SELECTED="${MAX_SELECTED:-5000}"
-VLM_BACKEND="${VLM_BACKEND:-qwen2_5_vl}"
-VLM_MODEL_ID="${VLM_MODEL_ID:-Qwen/Qwen2.5-VL-7B-Instruct}"
+VLM_BACKEND="${VLM_BACKEND:-qwen_vl}"
+VLM_MODEL_ID="${VLM_MODEL_ID:-Qwen/Qwen3-VL-8B-Instruct}"
 
 bash scripts/prepare_remote_data.sh \
   --stage all \

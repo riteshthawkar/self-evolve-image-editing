@@ -3,8 +3,8 @@ input:
   source: directory
   images_dir: data/unlabeled/raw
 vlm:
-  backend: qwen2_5_vl
-  model_id: Qwen/Qwen2.5-VL-7B-Instruct
+  backend: qwen_vl
+  model_id: Qwen/Qwen3-VL-8B-Instruct
   device: auto
   torch_dtype: auto
   max_new_tokens: 512

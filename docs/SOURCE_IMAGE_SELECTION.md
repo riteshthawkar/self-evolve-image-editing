@@ -54,7 +54,7 @@ Default config:
 bash scripts/select_unlabeled_images.sh
 ```
 
-This uses `Qwen/Qwen2.5-VL-7B-Instruct` through `transformers`.
+This uses `Qwen/Qwen3-VL-8B-Instruct` through `transformers` by default.
 
 Override the raw pool:
 
@@ -75,8 +75,15 @@ If GPU memory is tight:
 
 ```bash
 bash scripts/select_unlabeled_images.sh \
-  --set vlm.model_id=Qwen/Qwen2.5-VL-3B-Instruct \
+  --set vlm.model_id=Qwen/Qwen3-VL-4B-Instruct \
   --set vlm.torch_dtype=float16
+```
+
+To reproduce the older filtering baseline, override the model:
+
+```bash
+bash scripts/select_unlabeled_images.sh \
+  --set vlm.model_id=Qwen/Qwen2.5-VL-7B-Instruct
 ```
 
 ## Heuristic Backend

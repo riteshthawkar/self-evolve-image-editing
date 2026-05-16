@@ -22,6 +22,7 @@ Why this is resource-aware:
 ## Default Source Pool
 
 The default config uses `regisss/coco_2017` from Hugging Face because it provides natural images with captions and stable image IDs.
+The default VLM filter is `Qwen/Qwen3-VL-8B-Instruct`. On an H200, use BF16 unless the cluster PyTorch build requires FP16.
 
 Config:
 

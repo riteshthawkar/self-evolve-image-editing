@@ -197,7 +197,7 @@ class QwenOpenVLMScorer:
         if self.model is not None and self.processor is not None:
             return self.model, self.processor
         import torch
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        from transformers import AutoProcessor
 
         dtype = "auto"
         if self.torch_dtype == "float16":
@@ -206,11 +206,32 @@ class QwenOpenVLMScorer:
             dtype = torch.bfloat16
 
         device_map = "auto" if self.device == "auto" else {"": self.device}
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_id,
-            torch_dtype=dtype,
-            device_map=device_map,
-        )
+        load_kwargs = {"device_map": device_map}
+        if dtype != "auto":
+            load_kwargs["torch_dtype"] = dtype
+        else:
+            load_kwargs["torch_dtype"] = "auto"
+
+        model_id_lower = self.model_id.lower()
+        if "qwen3-vl" in model_id_lower:
+            try:
+                from transformers import Qwen3VLForConditionalGeneration
+
+                self.model = Qwen3VLForConditionalGeneration.from_pretrained(self.model_id, **load_kwargs)
+            except ImportError as exc:
+                raise ImportError(
+                    "Qwen3-VL requires a recent transformers build with Qwen3VLForConditionalGeneration. "
+                    "Upgrade with: pip install --upgrade transformers accelerate qwen-vl-utils"
+                ) from exc
+        else:
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration
+
+                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(self.model_id, **load_kwargs)
+            except ImportError:
+                from transformers import AutoModelForImageTextToText
+
+                self.model = AutoModelForImageTextToText.from_pretrained(self.model_id, **load_kwargs)
         self.processor = AutoProcessor.from_pretrained(self.model_id)
         return self.model, self.processor
 

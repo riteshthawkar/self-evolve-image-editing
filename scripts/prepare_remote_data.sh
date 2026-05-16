@@ -26,8 +26,8 @@ Options:
   --raw-dir PATH               Raw image output directory. Default: data/unlabeled/raw/coco2017
   --selected-dir PATH          Selected manifest output directory. Default: data/unlabeled/selected/coco2017
   --split-dir PATH             Split output directory. Default: data/unlabeled/splits/coco2017
-  --vlm-backend NAME           qwen2_5_vl or heuristic. Default: qwen2_5_vl
-  --vlm-model-id ID            Open VLM model ID. Default: Qwen/Qwen2.5-VL-7B-Instruct
+  --vlm-backend NAME           qwen_vl or heuristic. Default: qwen_vl
+  --vlm-model-id ID            Open VLM model ID. Default: Qwen/Qwen3-VL-8B-Instruct
   --pilot-count N              Pilot split size. Default: 128
   --main-count N               Main split size. Default: 1024
   --heldout-count N            Heldout split size. Default: 128
@@ -52,8 +52,8 @@ MAX_SELECTED=5000
 RAW_DIR="data/unlabeled/raw/coco2017"
 SELECTED_DIR="data/unlabeled/selected/coco2017"
 SPLIT_DIR="data/unlabeled/splits/coco2017"
-VLM_BACKEND="qwen2_5_vl"
-VLM_MODEL_ID="Qwen/Qwen2.5-VL-7B-Instruct"
+VLM_BACKEND="qwen_vl"
+VLM_MODEL_ID="Qwen/Qwen3-VL-8B-Instruct"
 PILOT_COUNT=128
 MAIN_COUNT=1024
 HELDOUT_COUNT=128

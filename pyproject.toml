@@ -19,7 +19,8 @@ dependencies = [
 vlm = [
   "accelerate>=0.33",
   "torch>=2.3",
-  "transformers>=4.51",
+  "transformers>=4.57",
+  "qwen-vl-utils>=0.0.14",
 ]
 
 [tool.setuptools]
