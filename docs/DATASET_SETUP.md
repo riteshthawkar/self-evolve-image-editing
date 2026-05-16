@@ -107,6 +107,29 @@ python -m qwen_edit_project.data.validate_manifest \
   --manifest data/manifests/train_metadata_qwen_edit.json
 ```
 
+### Download and filter MagicBrush automatically
+
+For a ready supervised edit-pair dataset, use the MagicBrush pipeline:
+
+```bash
+bash scripts/prepare_magicbrush.sh \
+  --limit 1000 \
+  --max-selected 800 \
+  --output-root data/edit_pairs/magicbrush_pilot \
+  --manifest data/manifests/magicbrush_pilot_filtered.json
+```
+
+Then train using:
+
+```bash
+bash scripts/train_lora_2509.sh \
+  --set dataset.dataset_base_path=. \
+  --set dataset.dataset_metadata_path=data/manifests/magicbrush_pilot_filtered.json \
+  --set output.output_path=outputs/checkpoints/qwen_edit_magicbrush_pilot_lora
+```
+
+See [EDIT_PAIR_DATA_PIPELINE.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/EDIT_PAIR_DATA_PIPELINE.md) for full commands, resume behavior, and generic Hugging Face dataset usage.
+
 ## 2. Unlabeled self-evolve pool
 
 The self-evolve configs default to directory mode.

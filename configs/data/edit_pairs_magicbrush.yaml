@@ -1,0 +1,41 @@
+name: edit_pairs_magicbrush
+dataset:
+  path: osunlp/MagicBrush
+  split: train
+  tag: magicbrush
+  streaming: false
+  shuffle: false
+  trust_remote_code: false
+columns:
+  id: img_id
+  turn: turn_index
+  source_image: source_img
+  target_image: target_img
+  instruction: instruction
+storage:
+  image_format: jpg
+  quality: 94
+  max_long_side: 1536
+output:
+  root_dir: data/edit_pairs/magicbrush
+  all_records_jsonl: data/edit_pairs/magicbrush/all_records.jsonl
+  selected_records_jsonl: data/edit_pairs/magicbrush/selected_records.jsonl
+  rejected_records_jsonl: data/edit_pairs/magicbrush/rejected_records.jsonl
+  manifest_json: data/manifests/magicbrush_filtered.json
+  summary_json: data/edit_pairs/magicbrush/summary.json
+  max_selected: 0
+  progress_every: 100
+  resume: true
+  stream_records: true
+filters:
+  min_short_side: 384
+  max_aspect_ratio: 2.6
+  min_source_quality: 0.30
+  min_target_quality: 0.30
+  min_instruction_score: 0.45
+  min_changed_fraction: 0.015
+  target_changed_fraction: 0.08
+  soft_max_changed_fraction: 0.55
+  max_changed_fraction: 0.82
+  min_preservation_fraction: 0.18
+  min_total_score: 0.50
