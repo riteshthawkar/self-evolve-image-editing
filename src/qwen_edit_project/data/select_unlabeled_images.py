@@ -426,6 +426,46 @@ def _materialize_selected(selected: list[dict[str, Any]], output_cfg: dict[str, 
             raise ValueError(f"Unsupported materialize_mode: {mode}")
 
 
+def threshold_reject_reasons(item: dict[str, Any], thresholds: dict[str, Any]) -> list[str]:
+    stats = item["stats"]
+    stats_scores = item["stats_scores"]
+    vlm = item["vlm"]
+    reject_reasons = list(vlm.get("reject_reasons", []))
+    if min(int(stats["width"]), int(stats["height"])) < int(thresholds.get("min_short_side", 384)):
+        reject_reasons.append("short_side_too_small")
+    if float(stats["aspect_ratio"]) > float(thresholds.get("max_aspect_ratio", 2.5)):
+        reject_reasons.append("extreme_aspect_ratio")
+    if float(stats_scores["technical_quality_score"]) < float(thresholds.get("min_technical_quality", 0.35)):
+        reject_reasons.append("low_technical_quality")
+    if float(vlm.get("quality_score", 0.0)) < float(thresholds.get("min_vlm_quality", 0.0)):
+        reject_reasons.append("low_vlm_quality")
+    if float(vlm.get("natural_image_score", 0.0)) < float(thresholds.get("min_natural_image", 0.0)):
+        reject_reasons.append("low_natural_image_score")
+    if float(vlm.get("editable_content_score", 0.0)) < float(thresholds.get("min_editable_content", 0.35)):
+        reject_reasons.append("low_editable_content")
+    if float(vlm.get("object_region_clarity", 0.0)) < float(thresholds.get("min_object_region_clarity", 0.0)):
+        reject_reasons.append("low_object_region_clarity")
+    if float(vlm.get("preservation_potential", 0.0)) < float(thresholds.get("min_preservation_potential", 0.30)):
+        reject_reasons.append("low_preservation_potential")
+    if len(vlm.get("edit_families", [])) < int(thresholds.get("min_edit_families", 1)):
+        reject_reasons.append("insufficient_edit_family_coverage")
+    if float(vlm.get("clutter_penalty", 0.0)) > float(thresholds.get("max_clutter_penalty", 1.0)):
+        reject_reasons.append("high_clutter_penalty")
+    if float(vlm.get("text_watermark_penalty", 0.0)) > float(thresholds.get("max_text_watermark_penalty", 1.0)):
+        reject_reasons.append("high_text_watermark_penalty")
+    if float(item["score"]) < float(thresholds.get("min_total_score", 0.45)):
+        reject_reasons.append("low_total_score")
+    return sorted(set(reject_reasons))
+
+
+def apply_thresholds(item: dict[str, Any], thresholds: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(item)
+    reject_reasons = threshold_reject_reasons(updated, thresholds)
+    updated["reject_reasons"] = reject_reasons
+    updated["accepted"] = not reject_reasons
+    return updated
+
+
 def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str, Any]:
     input_cfg = config["input"]
     images_dir = resolve_path(input_cfg.get("images_dir"))
@@ -477,34 +517,18 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
             stats_scores = _stats_to_scores(stats)
             vlm = scorer.score(image_path, stats)
             score = combine_score(stats_scores, vlm, weights)
-            reject_reasons = list(vlm.reject_reasons)
-            if min(stats.width, stats.height) < int(thresholds.get("min_short_side", 384)):
-                reject_reasons.append("short_side_too_small")
-            if stats.aspect_ratio > float(thresholds.get("max_aspect_ratio", 2.5)):
-                reject_reasons.append("extreme_aspect_ratio")
-            if stats_scores["technical_quality_score"] < float(thresholds.get("min_technical_quality", 0.35)):
-                reject_reasons.append("low_technical_quality")
-            if vlm.editable_content_score < float(thresholds.get("min_editable_content", 0.35)):
-                reject_reasons.append("low_editable_content")
-            if vlm.preservation_potential < float(thresholds.get("min_preservation_potential", 0.30)):
-                reject_reasons.append("low_preservation_potential")
-            if len(vlm.edit_families) < int(thresholds.get("min_edit_families", 1)):
-                reject_reasons.append("insufficient_edit_family_coverage")
-            if score < float(thresholds.get("min_total_score", 0.45)):
-                reject_reasons.append("low_total_score")
             item = {
                 "key": image_key(image_path, images_dir),
                 "image": image_rel,
                 "caption": vlm.caption,
                 "score": score,
-                "accepted": not reject_reasons,
-                "reject_reasons": sorted(set(reject_reasons)),
                 "edit_families": vlm.edit_families,
                 "primary_family": vlm.edit_families[0] if vlm.edit_families else "unknown",
                 "stats": _asdict_stats(stats),
                 "stats_scores": stats_scores,
                 "vlm": _asdict_vlm(vlm),
             }
+            item = apply_thresholds(item, thresholds)
             scored.append(item)
             scored_by_image[image_rel] = item
             if score_handle is not None:
@@ -515,13 +539,14 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
                 rate = len(scored) / elapsed
                 print(
                     f"Scored {len(scored)} / {len(image_paths)} images "
-                    f"({rate:.2f} img/s, latest_score={score:.3f}, accepted={not reject_reasons})",
+                    f"({rate:.2f} img/s, latest_score={score:.3f}, accepted={item['accepted']})",
                     flush=True,
                 )
     finally:
         if score_handle is not None:
             score_handle.close()
 
+    scored = [apply_thresholds(item, thresholds) for item in scored]
     write_jsonl(scored, score_jsonl)
 
     candidates = sorted((item for item in scored if item["accepted"]), key=lambda item: item["score"], reverse=True)

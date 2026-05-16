@@ -111,7 +111,9 @@ The selector combines:
 - clutter and text penalties: dense text, watermarks, and overly cluttered scenes are downweighted
 - diversity filter: near-duplicates are removed using average-hash distance
 
-The score is intentionally not pure top-k aesthetics. It is designed to select images useful for editing self-training.
+The score is intentionally not pure top-k aesthetics. It is designed to select images useful for editing self-training. The default gates are intentionally stricter than "is this a natural image": an image must pass editability, preservation, clarity, clutter, and total-score thresholds before final top-k and diversity selection.
+
+The filter streams `scores.jsonl` while running and replays thresholds from existing scores when resumed. This means you can tighten thresholds and rerun without rescoring already processed images.
 
 ## Output Format
 
