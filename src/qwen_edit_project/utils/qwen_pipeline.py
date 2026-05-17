@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +113,19 @@ def build_generation_kwargs(generation: dict[str, Any]) -> dict[str, Any]:
     if generation.get("true_cfg_scale") is not None:
         kwargs["true_cfg_scale"] = generation["true_cfg_scale"]
     return kwargs
+
+
+def _filter_pipeline_kwargs(pipe: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keep configs portable across DiffSynth releases with different call signatures."""
+    try:
+        signature = inspect.signature(pipe.__call__)
+    except (TypeError, ValueError):
+        return kwargs
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return kwargs
+    allowed = set(parameters)
+    return {key: value for key, value in kwargs.items() if key in allowed}
 
 
 def _calculate_qwen_edit_resize(target_area: int, ratio: float) -> tuple[int, int]:
@@ -270,7 +284,7 @@ def render_edit(
     conditioning = normalize_edit_inputs(edit_images)
     kwargs = build_generation_kwargs(generation)
     kwargs["edit_image"] = conditioning
-    return pipe(prompt, **kwargs)
+    return pipe(prompt, **_filter_pipeline_kwargs(pipe, kwargs))
 
 
 def render_generation(
@@ -278,4 +292,4 @@ def render_generation(
     prompt: str,
     generation: dict[str, Any],
 ) -> Image.Image:
-    return pipe(prompt, **build_generation_kwargs(generation))
+    return pipe(prompt, **_filter_pipeline_kwargs(pipe, build_generation_kwargs(generation)))
