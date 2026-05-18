@@ -18,6 +18,8 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--no-resume", action="store_true", help="Regenerate images even when output files already exist.")
     parser.add_argument("--set", action="append", default=[])
     args = parser.parse_args()
 
@@ -36,6 +38,8 @@ def main() -> None:
         edit_specs = json.load(handle)
 
     items = list(edit_specs.items())
+    if args.offset:
+        items = items[args.offset :]
     if args.limit is not None:
         items = items[: args.limit]
 
@@ -50,7 +54,14 @@ def main() -> None:
 
     generation = dict(config["generation"])
     written = 0
+    skipped = 0
+    failed = 0
+    failures: list[dict[str, str]] = []
     for key, item in items:
+        out_path = output_root / f"{key}.png"
+        if out_path.exists() and not args.no_resume:
+            skipped += 1
+            continue
         input_image_path = origin_root / item["id"]
         prompt = polish_prompt(
             item["prompt"],
@@ -58,10 +69,25 @@ def main() -> None:
         )
         with Image.open(input_image_path) as image:
             generation["width"], generation["height"] = image.size
-        output = render_edit(pipe, prompt, [input_image_path], generation)
-        image = output.images[0] if hasattr(output, "images") else output
-        image.save(output_root / f"{key}.png")
+        try:
+            output = render_edit(pipe, prompt, [input_image_path], generation)
+            image = output.images[0] if hasattr(output, "images") else output
+            tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+            image.save(tmp_path)
+            tmp_path.replace(out_path)
+        except Exception as exc:
+            failed += 1
+            failures.append({"key": str(key), "error": repr(exc)})
+            print(f"Failed ImgEdit export for {key}: {exc}", flush=True)
+            continue
         written += 1
+        done = written + skipped + failed
+        if done % int(config["output"].get("progress_every", 25)) == 0:
+            print(
+                f"ImgEdit export progress: processed={done}/{len(items)} "
+                f"written={written} skipped={skipped} failed={failed}",
+                flush=True,
+            )
 
     summary = base_run_metadata()
     summary.update(
@@ -71,13 +97,22 @@ def main() -> None:
             "model_name": model_cfg["model_name"],
             "checkpoint_path": model_cfg.get("checkpoint_path"),
             "records_exported": written,
+            "records_skipped_existing": skipped,
+            "records_failed": failed,
+            "records_requested": len(items),
             "output_root": str(output_root),
+            "failures": failures,
         }
     )
     summary_path = resolve_path(config["output"]["summary_path"])
     if summary_path is None:
         raise ValueError("output.summary_path must resolve")
     save_json(summary, summary_path.parent / f"{model_cfg['model_name']}_summary.json")
+    if failures:
+        failure_path = summary_path.parent / f"{model_cfg['model_name']}_export_failures.jsonl"
+        with failure_path.open("w", encoding="utf-8") as handle:
+            for failure in failures:
+                handle.write(json.dumps(failure, ensure_ascii=True) + "\n")
     print(f"Exported {written} ImgEdit images to {output_root}")
 
 

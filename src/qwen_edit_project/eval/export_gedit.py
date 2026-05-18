@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,8 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--no-resume", action="store_true", help="Regenerate images even when output files already exist.")
     parser.add_argument("--set", action="append", default=[])
     args = parser.parse_args()
 
@@ -54,6 +57,8 @@ def main() -> None:
         config = merge_override(config, key, value)
 
     records = load_gedit_records(config)
+    if args.offset:
+        records = records[args.offset :]
     if args.limit is not None:
         records = records[: args.limit]
 
@@ -70,18 +75,40 @@ def main() -> None:
     output_root = ensure_dir(resolve_path(config["output"]["edited_images_dir"])) / model_name / "fullset"
     generation = dict(config["generation"])
     written = 0
+    skipped = 0
+    failed = 0
+    failures: list[dict[str, str]] = []
     for item in records:
+        out_dir = ensure_dir(output_root / item["task_type"] / item["instruction_language"])
+        out_path = out_dir / f"{item['key']}.png"
+        if out_path.exists() and not args.no_resume:
+            skipped += 1
+            continue
         prompt = polish_prompt(
             item["instruction"],
             use_prompt_polish=config.get("prompting", {}).get("use_prompt_polish", False),
             image_context=item["input_image_raw"],
         )
         generation["width"], generation["height"] = item["input_image_raw"].size
-        output = render_edit(pipe, prompt, [item["input_image_raw"]], generation)
-        image = output.images[0] if hasattr(output, "images") else output
-        out_dir = ensure_dir(output_root / item["task_type"] / item["instruction_language"])
-        image.save(out_dir / f"{item['key']}.png")
+        try:
+            output = render_edit(pipe, prompt, [item["input_image_raw"]], generation)
+            image = output.images[0] if hasattr(output, "images") else output
+            tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+            image.save(tmp_path)
+            tmp_path.replace(out_path)
+        except Exception as exc:
+            failed += 1
+            failures.append({"key": str(item["key"]), "error": repr(exc)})
+            print(f"Failed GEdit export for {item['key']}: {exc}", flush=True)
+            continue
         written += 1
+        done = written + skipped + failed
+        if done % int(config["output"].get("progress_every", 25)) == 0:
+            print(
+                f"GEdit export progress: processed={done}/{len(records)} "
+                f"written={written} skipped={skipped} failed={failed}",
+                flush=True,
+            )
 
     summary = base_run_metadata()
     summary.update(
@@ -91,13 +118,22 @@ def main() -> None:
             "model_name": model_name,
             "checkpoint_path": model_cfg.get("checkpoint_path"),
             "records_exported": written,
+            "records_skipped_existing": skipped,
+            "records_failed": failed,
+            "records_requested": len(records),
             "output_root": str(output_root),
+            "failures": failures,
         }
     )
     summary_path = resolve_path(config["output"]["summary_path"])
     if summary_path is None:
         raise ValueError("output.summary_path must resolve")
     save_json(summary, summary_path.parent / f"{model_name}_summary.json")
+    if failures:
+        failure_path = summary_path.parent / f"{model_name}_export_failures.jsonl"
+        with failure_path.open("w", encoding="utf-8") as handle:
+            for failure in failures:
+                handle.write(json.dumps(failure, ensure_ascii=True) + "\n")
     print(f"Exported {written} GEdit images to {output_root}")
 
 
