@@ -16,6 +16,30 @@ def ensure_secret_env(secret_path: Path, target_path: Path) -> None:
     target_path.write_text(secret_path.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def validate_gedit_export_complete(config: dict, model_dir: Path) -> None:
+    if bool(config["scoring"].get("allow_partial", False)):
+        return
+    from qwen_edit_project.eval.export_gedit import load_gedit_records
+
+    expected = load_gedit_records(config)
+    missing: list[Path] = []
+    for item in expected:
+        path = model_dir / item["task_type"] / item["instruction_language"] / f"{item['key']}.png"
+        if not path.exists():
+            missing.append(path)
+            if len(missing) >= 20:
+                break
+    if missing:
+        total_existing = sum(1 for _ in model_dir.rglob("*.png"))
+        raise FileNotFoundError(
+            "GEdit export is incomplete. The official scorer expects the full configured "
+            f"benchmark split before scoring. Found {total_existing} generated PNGs under "
+            f"{model_dir}; first missing files:\n"
+            + "\n".join(f"  - {path}" for path in missing)
+            + "\nRerun export without --limit, or set scoring.allow_partial=true only for debugging."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run GEdit public scorer.")
     parser.add_argument("--config", required=True)
@@ -35,6 +59,7 @@ def main() -> None:
     model_dir = edited_images_dir / model_name / "fullset"
     if not model_dir.exists():
         raise FileNotFoundError(f"GEdit output directory not found: {model_dir}")
+    validate_gedit_export_complete(config, model_dir)
 
     repo_root = resolve_path(".")
     secret_env = os.environ.get("GEDIT_SECRET_ENV_PATH") or config["scoring"].get("scorer_secret_env_path")
