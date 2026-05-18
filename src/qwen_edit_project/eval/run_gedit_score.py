@@ -46,13 +46,24 @@ def main() -> None:
     had_existing_secret = local_secret.exists()
     original_secret = local_secret.read_text(encoding="utf-8") if had_existing_secret else None
     ensure_secret_env(secret_path, local_secret)
+    gedit_root = resolve_path("third_party/step1x-edit/GEdit-Bench")
+    if gedit_root is None or not gedit_root.exists():
+        raise FileNotFoundError("GEdit scorer repo is missing. Run scripts/bootstrap.sh first.")
+    scorer_pythonpath = os.pathsep.join(
+        [
+            str(gedit_root / "viescore"),
+            str(gedit_root),
+            os.environ.get("PYTHONPATH", ""),
+        ]
+    )
+    scorer_env = {"PYTHONPATH": scorer_pythonpath}
 
     timestamp = utc_timestamp()
     log_path = resolve_path(f"outputs/logs/gedit_score_{timestamp}.log")
     try:
         command = [
             python_executable,
-            str(resolve_path("third_party/step1x-edit/GEdit-Bench/run_gedit_score.py")),
+            str(gedit_root / "run_gedit_score.py"),
             "--model_name",
             model_name,
             "--edited_images_dir",
@@ -62,14 +73,14 @@ def main() -> None:
             "--backbone",
             config["scoring"].get("backbone", "gpt4o"),
         ]
-        return_code = run_and_tee(command, cwd=repo_root, log_path=log_path)
+        return_code = run_and_tee(command, cwd=repo_root, log_path=log_path, env=scorer_env)
         if return_code != 0:
             raise SystemExit(return_code)
 
         stats_log = resolve_path(f"outputs/logs/gedit_stats_{timestamp}.log")
         stats_command = [
             python_executable,
-            str(resolve_path("third_party/step1x-edit/GEdit-Bench/calculate_statistics.py")),
+            str(gedit_root / "calculate_statistics.py"),
             "--model_name",
             model_name,
             "--backbone",
@@ -79,7 +90,7 @@ def main() -> None:
             "--language",
             config["dataset"].get("instruction_language", "all"),
         ]
-        return_code = run_and_tee(stats_command, cwd=repo_root, log_path=stats_log)
+        return_code = run_and_tee(stats_command, cwd=repo_root, log_path=stats_log, env=scorer_env)
         if return_code != 0:
             raise SystemExit(return_code)
     finally:
