@@ -94,7 +94,7 @@ def main() -> None:
             output = render_edit(pipe, prompt, [item["input_image_raw"]], generation)
             image = output.images[0] if hasattr(output, "images") else output
             tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-            image.save(tmp_path)
+            image.save(tmp_path, format="PNG")
             tmp_path.replace(out_path)
         except Exception as exc:
             failed += 1
