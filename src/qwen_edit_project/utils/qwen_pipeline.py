@@ -221,8 +221,20 @@ def _calculate_qwen_edit_resize(target_area: int, ratio: float) -> tuple[int, in
 
 
 def _resize_for_qwen_edit_understanding(image: Image.Image) -> Image.Image:
-    width, height = _calculate_qwen_edit_resize(1024 * 1024, image.size[0] / image.size[1])
+    # CEPR scoring runs alongside a very large editor; cap internal-reward feature
+    # extraction lower than generation resolution to avoid reward-side OOM.
+    width, height = _calculate_qwen_edit_resize(512 * 512, image.size[0] / image.size[1])
     return image.resize((width, height))
+
+
+def _module_device_and_dtype(module: Any, fallback_device: Any, fallback_dtype: Any = None) -> tuple[Any, Any]:
+    if module is not None:
+        try:
+            parameter = next(module.parameters())
+            return parameter.device, parameter.dtype
+        except Exception:
+            pass
+    return fallback_device, fallback_dtype
 
 
 def _extract_masked_hidden_states(hidden_states, attention_mask):
@@ -302,11 +314,12 @@ def extract_qwen_edit_understanding_features(
 
     images = normalize_edit_inputs(edit_images)
     image_list = images if isinstance(images, list) else [images]
-    processor_images = image_list if len(image_list) == 1 else [_resize_for_qwen_edit_understanding(image) for image in image_list]
+    processor_images = [_resize_for_qwen_edit_understanding(image) for image in image_list]
     processor_input = processor_images[0] if len(processor_images) == 1 else processor_images
     text, drop_idx = _build_qwen_edit_prompt(pipe, prompt, len(image_list))
-    device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
-    dtype = getattr(pipe, "torch_dtype", getattr(getattr(pipe, "text_encoder", None), "dtype", None))
+    fallback_device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
+    fallback_dtype = getattr(pipe, "torch_dtype", getattr(getattr(pipe, "text_encoder", None), "dtype", None))
+    device, dtype = _module_device_and_dtype(getattr(pipe, "text_encoder", None), fallback_device, fallback_dtype)
     model_inputs = pipe.processor(text=[text], images=processor_input, padding=True, return_tensors="pt").to(device)
     outputs = pipe.text_encoder(
         input_ids=model_inputs.input_ids,
@@ -350,8 +363,9 @@ def extract_qwen_text_features(
         raise ValueError("Qwen text features require a pipeline with both tokenizer or processor.tokenizer and text_encoder.")
 
     text, drop_idx = _build_qwen_text_prompt(prompt)
-    device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
-    dtype = getattr(pipe, "torch_dtype", getattr(getattr(pipe, "text_encoder", None), "dtype", None))
+    fallback_device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
+    fallback_dtype = getattr(pipe, "torch_dtype", getattr(getattr(pipe, "text_encoder", None), "dtype", None))
+    device, dtype = _module_device_and_dtype(getattr(pipe, "text_encoder", None), fallback_device, fallback_dtype)
     model_inputs = tokenizer([text], padding=True, return_tensors="pt").to(device)
     outputs = pipe.text_encoder(
         input_ids=model_inputs.input_ids,
@@ -415,8 +429,9 @@ def extract_qwen_vae_latents(
     if vae is None or not hasattr(vae, "encode"):
         raise ValueError("Qwen VAE latents require a pipeline with a VAE encoder.")
 
-    device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
-    dtype = getattr(pipe, "torch_dtype", getattr(vae, "dtype", torch.float32))
+    fallback_device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
+    fallback_dtype = getattr(pipe, "torch_dtype", getattr(vae, "dtype", torch.float32))
+    device, dtype = _module_device_and_dtype(vae, fallback_device, fallback_dtype)
     if dtype is None:
         dtype = torch.float32
     pixel_values = _image_to_vae_tensor(pipe, image, size=size, device=device, dtype=dtype)

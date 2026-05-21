@@ -294,6 +294,8 @@ class QwenEditEditor:
         """Ensure heavyweight generation modules are on the target device."""
         pipeline = self._ensure_pipeline()
         device = self._resolved_torch_device()
+        if hasattr(pipeline, "to"):
+            pipeline.to(device)
         for name in ("transformer", "dit", "unet", "text_encoder", "vae"):
             self._move_module(getattr(pipeline, name, None), device)
         self._empty_cuda_cache()
@@ -307,6 +309,9 @@ class QwenEditEditor:
         so we temporarily offload the transformer/DiT to CPU.
         """
         pipeline = self._ensure_pipeline()
+        if hasattr(pipeline, "to"):
+            pipeline.to("cpu")
+        self._empty_cuda_cache()
         for name in ("transformer", "dit", "unet"):
             self._move_module(getattr(pipeline, name, None), "cpu")
         device = self._resolved_torch_device()
