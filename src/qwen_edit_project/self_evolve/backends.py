@@ -268,7 +268,54 @@ class QwenEditEditor:
         )
         return self.pipeline
 
+    def _resolved_torch_device(self):
+        import torch
+
+        if self.device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(self.device)
+
+    @staticmethod
+    def _empty_cuda_cache() -> None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            return
+
+    @staticmethod
+    def _move_module(module: Any, device: Any) -> None:
+        if module is not None and hasattr(module, "to"):
+            module.to(device)
+
+    def prepare_for_generation(self) -> None:
+        """Ensure heavyweight generation modules are on the target device."""
+        pipeline = self._ensure_pipeline()
+        device = self._resolved_torch_device()
+        for name in ("transformer", "dit", "unet", "text_encoder", "vae"):
+            self._move_module(getattr(pipeline, name, None), device)
+        self._empty_cuda_cache()
+
+    def prepare_for_internal_scoring(self) -> None:
+        """Free generation-only GPU memory before internal CEPR scoring.
+
+        Qwen-Image-Edit generation fits on a large H200, but it leaves almost no free
+        memory for extra internal text/VAE reward passes. CEPR scoring only needs the
+        editor's text/understanding path and VAE latents, not the diffusion transformer,
+        so we temporarily offload the transformer/DiT to CPU.
+        """
+        pipeline = self._ensure_pipeline()
+        for name in ("transformer", "dit", "unet"):
+            self._move_module(getattr(pipeline, name, None), "cpu")
+        device = self._resolved_torch_device()
+        for name in ("text_encoder", "vae"):
+            self._move_module(getattr(pipeline, name, None), device)
+        self._empty_cuda_cache()
+
     def edit_image(self, image: Image.Image, instruction: str, operation_id: str | None = None) -> Image.Image:
+        self.prepare_for_generation()
         pipeline = self._ensure_pipeline()
         generation = dict(self.generation)
         if bool(generation.get("preserve_input_resolution", True)):
@@ -1285,6 +1332,8 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
         if not edited_candidates:
             return []
         try:
+            if hasattr(editor, "prepare_for_internal_scoring"):
+                editor.prepare_for_internal_scoring()
             pipe = self._get_internal_pipe(editor)
         except Exception as exc:
             return [
