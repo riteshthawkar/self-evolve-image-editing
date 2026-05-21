@@ -162,21 +162,33 @@ def threshold_acceptance(rows: list[dict[str, Any]], thresholds: dict[str, float
 
 
 def component_correlations(rows: list[dict[str, Any]]) -> dict[str, dict[str, float | None]]:
-    target = [row_score(row, "cepr_raw_reward") for row in rows]
     output: dict[str, dict[str, float | None]] = {}
     for key in CEPR_COMPONENTS + CEPR_SIGNALS:
         source = "component_scores" if key in CEPR_COMPONENTS else "signals"
-        values = numeric_values(rows, key, source)
-        if len(values) != len(target) or len(values) <= 1:
-            output[key] = {"pearson_with_raw_reward": None}
+        pairs: list[tuple[float, float]] = []
+        for row in rows:
+            solver = row.get("solver", {})
+            target_value = solver.get("component_scores", {}).get("cepr_raw_reward")
+            value = solver.get(source, {}).get(key)
+            if (
+                isinstance(target_value, (int, float))
+                and isinstance(value, (int, float))
+                and math.isfinite(float(target_value))
+                and math.isfinite(float(value))
+            ):
+                pairs.append((float(value), float(target_value)))
+        if len(pairs) <= 1:
+            output[key] = {"pearson_with_raw_reward": None, "pair_count": len(pairs)}
             continue
+        values = [pair[0] for pair in pairs]
+        target = [pair[1] for pair in pairs]
         x_mean = mean(values)
         y_mean = mean(target)
         numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(values, target))
         x_var = sum((x - x_mean) ** 2 for x in values)
         y_var = sum((y - y_mean) ** 2 for y in target)
         corr = numerator / math.sqrt(x_var * y_var) if x_var > 0 and y_var > 0 else None
-        output[key] = {"pearson_with_raw_reward": corr}
+        output[key] = {"pearson_with_raw_reward": corr, "pair_count": len(pairs)}
     return output
 
 
