@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 import statistics
+import gc
 from typing import Any
 
 from PIL import Image, ImageEnhance, ImageOps
@@ -280,6 +281,7 @@ class QwenEditEditor:
         try:
             import torch
 
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
@@ -300,7 +302,7 @@ class QwenEditEditor:
             self._move_module(getattr(pipeline, name, None), device)
         self._empty_cuda_cache()
 
-    def prepare_for_internal_scoring(self) -> None:
+    def prepare_for_internal_scoring(self, scoring_device: str | None = None) -> None:
         """Free generation-only GPU memory before internal CEPR scoring.
 
         Qwen-Image-Edit generation fits on a large H200, but it leaves almost no free
@@ -314,7 +316,7 @@ class QwenEditEditor:
         self._empty_cuda_cache()
         for name in ("transformer", "dit", "unet"):
             self._move_module(getattr(pipeline, name, None), "cpu")
-        device = self._resolved_torch_device()
+        device = scoring_device or self._resolved_torch_device()
         for name in ("text_encoder", "vae"):
             self._move_module(getattr(pipeline, name, None), device)
         self._empty_cuda_cache()
@@ -1102,12 +1104,19 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
         self.latent_preservation_temperature = float(config.get("latent_preservation_temperature", 0.12))
         self.max_total_latent_delta = float(config.get("max_total_latent_delta", 0.45))
         self.latent_drift_temperature = float(config.get("latent_drift_temperature", 0.15))
+        self.empty_cache_per_candidate = bool(config.get("empty_cache_per_candidate", True))
+        self.retry_cpu_on_oom = bool(config.get("retry_cpu_on_oom", True))
 
     @staticmethod
     def _cosine_similarity(value_a: Any, value_b: Any) -> float:
         import torch.nn.functional as F
 
         return float(F.cosine_similarity(value_a.unsqueeze(0), value_b.unsqueeze(0)).item())
+
+    @staticmethod
+    def _is_cuda_oom(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "cuda out of memory" in message or exc.__class__.__name__ == "OutOfMemoryError"
 
     def _get_internal_pipe(self, editor: Any | None) -> Any:
         if not isinstance(editor, QwenEditEditor):
@@ -1318,6 +1327,68 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
             signals=signals,
         )
 
+    def _candidate_error_row(self, exc: Exception, candidate_index: int, scoring_device: str) -> dict[str, Any]:
+        return {
+            "candidate_index": candidate_index,
+            "edit_specificity": 0.0,
+            "preservation": 0.0,
+            "validity": 0.0,
+            "reward": 0.0,
+            "raw_reward": 0.0,
+            "feasible": False,
+            "signals": {
+                "cepr_internal_supported": 0.0,
+                "cepr_candidate_runtime_error": 1.0,
+                "cepr_candidate_runtime_error_type": exc.__class__.__name__,
+                "cepr_candidate_runtime_error_message": str(exc)[:500],
+                "cepr_scoring_device": scoring_device,
+            },
+        }
+
+    def _score_candidate_row(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        scoring_device: str,
+    ) -> dict[str, Any]:
+        cache: dict[tuple[str, str], Any] = {}
+        try:
+            edit_specificity, edit_signals = self._edit_specificity(
+                pipe, proposal, original, edited, candidate_index, cache
+            )
+            preservation, validity, preservation_signals = self._preservation_and_validity(
+                pipe, proposal, original, edited, candidate_index, cache
+            )
+            reward = math.sqrt(max(edit_specificity * preservation, 0.0))
+            feasible = (
+                edit_specificity >= self.edit_threshold
+                and preservation >= self.preservation_threshold
+                and validity >= self.validity_threshold
+                and reward >= self.reward_threshold
+            )
+            return {
+                "candidate_index": candidate_index,
+                "edit_specificity": edit_specificity,
+                "preservation": preservation,
+                "validity": validity,
+                "reward": reward if feasible else 0.0,
+                "raw_reward": reward,
+                "feasible": feasible,
+                "signals": {
+                    **edit_signals,
+                    **preservation_signals,
+                    "cepr_internal_supported": 1.0,
+                    "cepr_scoring_device": scoring_device,
+                },
+            }
+        finally:
+            cache.clear()
+            if self.empty_cache_per_candidate:
+                QwenEditEditor._empty_cuda_cache()
+
     def score(
         self,
         proposal: EditProposal,
@@ -1336,63 +1407,29 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
     ) -> list[SolverResult]:
         if not edited_candidates:
             return []
-        try:
-            if hasattr(editor, "prepare_for_internal_scoring"):
-                editor.prepare_for_internal_scoring()
-            pipe = self._get_internal_pipe(editor)
-        except Exception as exc:
-            return [
-                self._failure_result("cepr_internal_pipeline_error", candidate_index, len(edited_candidates))
-                for candidate_index in range(len(edited_candidates))
-            ]
-
-        cache: dict[tuple[str, str], Any] = {}
         rows: list[dict[str, Any]] = []
         for candidate_index, edited in enumerate(edited_candidates):
             try:
-                edit_specificity, edit_signals = self._edit_specificity(
-                    pipe, proposal, original, edited, candidate_index, cache
-                )
-                preservation, validity, preservation_signals = self._preservation_and_validity(
-                    pipe, proposal, original, edited, candidate_index, cache
-                )
-                reward = math.sqrt(max(edit_specificity * preservation, 0.0))
-                feasible = (
-                    edit_specificity >= self.edit_threshold
-                    and preservation >= self.preservation_threshold
-                    and validity >= self.validity_threshold
-                    and reward >= self.reward_threshold
-                )
-                rows.append(
-                    {
-                        "candidate_index": candidate_index,
-                        "edit_specificity": edit_specificity,
-                        "preservation": preservation,
-                        "validity": validity,
-                        "reward": reward if feasible else 0.0,
-                        "raw_reward": reward,
-                        "feasible": feasible,
-                        "signals": {**edit_signals, **preservation_signals, "cepr_internal_supported": 1.0},
-                    }
-                )
+                if hasattr(editor, "prepare_for_internal_scoring"):
+                    editor.prepare_for_internal_scoring()
+                pipe = self._get_internal_pipe(editor)
+                rows.append(self._score_candidate_row(pipe, proposal, original, edited, candidate_index, "cuda"))
             except Exception as exc:
-                rows.append(
-                    {
-                        "candidate_index": candidate_index,
-                        "edit_specificity": 0.0,
-                        "preservation": 0.0,
-                        "validity": 0.0,
-                        "reward": 0.0,
-                        "raw_reward": 0.0,
-                        "feasible": False,
-                        "signals": {
-                            "cepr_internal_supported": 0.0,
-                            "cepr_candidate_runtime_error": 1.0,
-                            "cepr_candidate_runtime_error_type": exc.__class__.__name__,
-                            "cepr_candidate_runtime_error_message": str(exc)[:500],
-                        },
-                    }
-                )
+                if self.retry_cpu_on_oom and self._is_cuda_oom(exc) and hasattr(editor, "prepare_for_internal_scoring"):
+                    try:
+                        QwenEditEditor._empty_cuda_cache()
+                        editor.prepare_for_internal_scoring(scoring_device="cpu")
+                        pipe = self._get_internal_pipe(editor)
+                        row = self._score_candidate_row(pipe, proposal, original, edited, candidate_index, "cpu")
+                        row["signals"]["cepr_gpu_oom_recovered"] = 1.0
+                        rows.append(row)
+                        continue
+                    except Exception as cpu_exc:
+                        row = self._candidate_error_row(cpu_exc, candidate_index, "cpu")
+                        row["signals"]["cepr_gpu_oom_before_cpu_retry"] = 1.0
+                        rows.append(row)
+                        continue
+                rows.append(self._candidate_error_row(exc, candidate_index, "cuda"))
 
         ranked_rows = sorted(
             [row for row in rows if row["feasible"]],

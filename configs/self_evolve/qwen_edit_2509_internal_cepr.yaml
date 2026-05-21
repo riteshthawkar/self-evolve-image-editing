@@ -60,6 +60,8 @@ solver:
   latent_preservation_temperature: 0.12
   max_total_latent_delta: 0.45
   latent_drift_temperature: 0.15
+  empty_cache_per_candidate: true
+  retry_cpu_on_oom: true
   require_internal_components: true
 curriculum:
   num_rounds: 2

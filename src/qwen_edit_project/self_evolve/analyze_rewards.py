@@ -195,6 +195,8 @@ def component_correlations(rows: list[dict[str, Any]]) -> dict[str, dict[str, fl
 def summarize(rows: list[dict[str, Any]], thresholds: dict[str, float]) -> dict[str, Any]:
     status_counts = Counter(str(row.get("status", "unknown")) for row in rows)
     runtime_errors = Counter()
+    scoring_devices = Counter()
+    recovered_gpu_oom = 0
     operations = Counter()
     families = Counter()
     gate_counter = Counter()
@@ -208,6 +210,10 @@ def summarize(rows: list[dict[str, Any]], thresholds: dict[str, float]) -> dict[
         error_type = signals.get("cepr_candidate_runtime_error_type")
         if error_type:
             runtime_errors[str(error_type)] += 1
+        scoring_device = signals.get("cepr_scoring_device")
+        if scoring_device:
+            scoring_devices[str(scoring_device)] += 1
+        recovered_gpu_oom += int(float(signals.get("cepr_gpu_oom_recovered", 0.0)))
         failures = gate_failures(row, thresholds)
         if failures:
             for failure in failures:
@@ -229,6 +235,8 @@ def summarize(rows: list[dict[str, Any]], thresholds: dict[str, float]) -> dict[
             "groups": len(grouped_by_proposal(rows)),
             "status": dict(status_counts),
             "runtime_errors": dict(runtime_errors),
+            "scoring_devices": dict(scoring_devices),
+            "gpu_oom_recovered": recovered_gpu_oom,
             "operations": dict(operations),
             "families": dict(families),
         },
