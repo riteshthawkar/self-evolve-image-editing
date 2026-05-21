@@ -10,7 +10,7 @@ usage() {
 Usage: bash scripts/run_self_evolve_matrix.sh [options]
 
 Options:
-  --variant NAME                base, spatial, cycle, internal, hybrid, delta-ranker, pillow-demo, pillow-hybrid, pillow-delta-ranker, or all. Default: all
+  --variant NAME                base, naive-self-train, evolmm-style, spatial, cycle, internal, hybrid, hybrid-scalar, delta-ranker, delta-ranker-proxy, delta-grounded, delta-results, pillow-demo, pillow-hybrid, pillow-delta-ranker, or all. Default: all
   --limit N                     Limit number of unlabeled records.
   --images-dir PATH             Override dataset.images_dir.
   --metadata-jsonl PATH         Optional sidecar metadata for directory datasets.
@@ -122,11 +122,17 @@ fi
 variant_script() {
   case "$1" in
     base) echo "scripts/self_evolve_2509.sh" ;;
+    naive-self-train) echo "scripts/self_evolve_2509.sh" ;;
+    evolmm-style) echo "scripts/self_evolve_2509_evolmm_style.sh" ;;
     spatial) echo "scripts/self_evolve_2509_spatial.sh" ;;
     cycle) echo "scripts/self_evolve_2509_cycle.sh" ;;
     internal) echo "scripts/self_evolve_2509_internal.sh" ;;
     hybrid) echo "scripts/self_evolve_2509_hybrid.sh" ;;
+    hybrid-scalar) echo "scripts/self_evolve_2509_hybrid.sh" ;;
     delta-ranker) echo "scripts/self_evolve_2509_delta_ranker.sh" ;;
+    delta-ranker-proxy) echo "scripts/self_evolve_2509_delta_ranker.sh" ;;
+    delta-grounded) echo "scripts/self_evolve_2509_delta_grounded.sh" ;;
+    delta-results) echo "scripts/self_evolve_2509_delta_results.sh" ;;
     pillow-demo) echo "scripts/self_evolve_pillow_demo.sh" ;;
     pillow-hybrid) echo "scripts/self_evolve_pillow_hybrid.sh" ;;
     pillow-delta-ranker) echo "scripts/self_evolve_pillow_delta_ranker.sh" ;;
@@ -135,7 +141,7 @@ variant_script() {
 }
 
 if [[ "$VARIANT" == "all" ]]; then
-  variants=(base spatial cycle internal hybrid delta-ranker)
+  variants=(base naive-self-train evolmm-style spatial cycle internal hybrid delta-ranker delta-grounded delta-results)
 else
   variants=("$VARIANT")
 fi
@@ -163,6 +169,23 @@ for current_variant in "${variants[@]}"; do
   if [[ -n "$OUTPUT_PREFIX" ]]; then
     cmd+=(--set "output.root_dir=$OUTPUT_PREFIX/$current_variant")
   fi
+  case "$current_variant" in
+    naive-self-train)
+      cmd+=(--set "candidate_generation.samples_per_proposal=1")
+      cmd+=(--set "solver.acceptance_threshold=0.60")
+      cmd+=(--set "curriculum.proposals_per_image=1")
+      ;;
+    hybrid-scalar)
+      cmd+=(--set "solver.cycle_weight=0.0")
+      cmd+=(--set "solver.internal_weight=0.0")
+      cmd+=(--set "output.write_evaluator_training=false")
+      ;;
+    delta-ranker-proxy)
+      cmd+=(--set "solver.internal_weight=0.0")
+      cmd+=(--set "solver.rank_internal_weight=0.0")
+      cmd+=(--set "solver.require_internal_when_weighted=false")
+      ;;
+  esac
   if [[ -n "$DTYPE" ]]; then
     cmd+=(--set "editor.model.torch_dtype=$DTYPE")
   fi

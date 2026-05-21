@@ -30,6 +30,12 @@ bash scripts/export_gedit.sh --device cuda
 
 The export is resumable. If it is interrupted, rerun the same command. The exporter refuses to reuse an existing output directory if its recorded provenance does not match the current paper-matched settings.
 
+Before launching a long run, verify the current configs:
+
+```bash
+bash scripts/check_experiment_contract.sh
+```
+
 ```bash
 find outputs/benchmark_images/gedit/qwen_edit_2509_official_diffusers/fullset -name "*.png" | wc -l
 ```

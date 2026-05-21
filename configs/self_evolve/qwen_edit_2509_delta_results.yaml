@@ -1,4 +1,4 @@
-name: self_evolve_qwen_edit_2509_spatial
+name: self_evolve_qwen_edit_2509_delta_results
 runtime:
   seed: 123
   dry_run: false
@@ -9,12 +9,23 @@ dataset:
   limit: null
 proposer:
   backend: scripted
+  family_policy: metadata_preferred
   families:
     - exposure
     - color
     - contrast
     - tone
     - style
+  operation_ids:
+    - brightness_up
+    - brightness_down
+    - saturation_up
+    - saturation_down
+    - contrast_up
+    - contrast_down
+    - warm_tone
+    - cool_tone
+    - grayscale
 editor:
   backend: qwen_edit
   device: auto
@@ -35,24 +46,43 @@ editor:
     torch_dtype: bfloat16
     local_files_only: false
     model_id_with_origin_paths: Qwen/Qwen-Image-Edit-2509:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors
+candidate_generation:
+  samples_per_proposal: 4
+  seed_stride: 7919
 solver:
-  backend: hybrid
+  backend: hard_gated_relative
   global_weight: 0.7
   local_weight: 0.3
-  proxy_weight: 0.8
-  spatial_weight: 0.2
+  proxy_weight: 0.55
+  spatial_weight: 0.25
   cycle_weight: 0.0
-  internal_weight: 0.0
+  internal_weight: 0.20
+  require_internal_when_weighted: true
+  internal_instruction_weight: 0.65
+  internal_prompt_gain_scale: 0.08
+  internal_neutral_score: 0.0
   acceptance_threshold: 0.72
+  instruction_threshold: 0.66
+  preservation_threshold: 0.72
+  quality_threshold: 0.55
+  max_disagreement: 0.30
+  top_m: 1
+  counterfactual_distractors: 3
+  counterfactual_backend: proxy
+  rank_spatial_weight: 0.35
+  rank_counterfactual_weight: 0.30
+  rank_relative_weight: 0.25
+  rank_cycle_weight: 0.00
+  rank_internal_weight: 0.10
 curriculum:
-  num_rounds: 3
+  num_rounds: 2
   proposals_per_image: 1
   initial_level: 1
   min_level: 1
   max_level: 3
-  promote_at: 0.75
-  demote_at: 0.45
-  max_records_per_round: 256
+  promote_at: 0.70
+  demote_at: 0.35
+  max_records_per_round: 512
 training:
   trigger: emit_only
   base_train_config: configs/train/lora_2509.yaml
@@ -60,6 +90,9 @@ training:
   reconstruction_replay_ratio: 0.15
   reconstruction_replay_prompt: Reconstruct the input image exactly. Preserve all content, layout, colors, and text.
 output:
-  root_dir: outputs/self_evolve/qwen_edit_2509_spatial
-  save_all_candidates: false
+  root_dir: outputs/self_evolve/qwen_edit_2509_delta_results
+  save_all_candidates: true
   use_cumulative_manifest: true
+  write_evaluator_training: true
+  train_verifiers:
+    - proxy

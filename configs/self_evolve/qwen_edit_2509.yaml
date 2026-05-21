@@ -20,15 +20,20 @@ editor:
   device: auto
   generation:
     seed: 42
-    num_inference_steps: 28
+    num_inference_steps: 40
     true_cfg_scale: 4.0
     guidance_scale: 1.0
     negative_prompt: " "
+    num_images_per_prompt: 1
+    preserve_input_resolution: false
   model:
+    backend: official_diffusers
+    base_model: Qwen/Qwen-Image-Edit-2509
     model_type: base
     checkpoint_path: null
     processor_model_id: Qwen/Qwen-Image-Edit
-    torch_dtype: auto
+    torch_dtype: bfloat16
+    local_files_only: false
     model_id_with_origin_paths: Qwen/Qwen-Image-Edit-2509:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors
 solver:
   backend: stat
@@ -48,6 +53,8 @@ training:
   trigger: emit_only
   base_train_config: configs/train/lora_2509.yaml
   current_checkpoint_path: null
+  reconstruction_replay_ratio: 0.15
+  reconstruction_replay_prompt: Reconstruct the input image exactly. Preserve all content, layout, colors, and text.
 output:
   root_dir: outputs/self_evolve/qwen_edit_2509
   save_all_candidates: false

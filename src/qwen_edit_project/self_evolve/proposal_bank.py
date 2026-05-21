@@ -14,6 +14,7 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="increase",
         target=0.08,
         expected_changed_fraction=(0.35, 1.0),
+        inverse_operation_id="brightness_down",
     ),
     ProposalDefinition(
         operation_id="brightness_down",
@@ -25,6 +26,7 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="decrease",
         target=0.08,
         expected_changed_fraction=(0.35, 1.0),
+        inverse_operation_id="brightness_up",
     ),
     ProposalDefinition(
         operation_id="saturation_up",
@@ -36,6 +38,7 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="increase",
         target=0.08,
         expected_changed_fraction=(0.30, 0.95),
+        inverse_operation_id="saturation_down",
     ),
     ProposalDefinition(
         operation_id="saturation_down",
@@ -47,6 +50,7 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="decrease",
         target=0.08,
         expected_changed_fraction=(0.30, 0.95),
+        inverse_operation_id="saturation_up",
     ),
     ProposalDefinition(
         operation_id="contrast_up",
@@ -58,6 +62,7 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="increase",
         target=0.06,
         expected_changed_fraction=(0.25, 0.95),
+        inverse_operation_id="contrast_down",
     ),
     ProposalDefinition(
         operation_id="contrast_down",
@@ -69,6 +74,7 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="decrease",
         target=0.05,
         expected_changed_fraction=(0.25, 0.95),
+        inverse_operation_id="contrast_up",
     ),
     ProposalDefinition(
         operation_id="warm_tone",
@@ -80,6 +86,7 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="increase",
         target=0.06,
         expected_changed_fraction=(0.25, 0.90),
+        inverse_operation_id="cool_tone",
     ),
     ProposalDefinition(
         operation_id="cool_tone",
@@ -91,6 +98,7 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="decrease",
         target=0.06,
         expected_changed_fraction=(0.25, 0.90),
+        inverse_operation_id="warm_tone",
     ),
     ProposalDefinition(
         operation_id="grayscale",
@@ -102,6 +110,66 @@ PROPOSAL_BANK: list[ProposalDefinition] = [
         direction="at_most",
         target=0.04,
         expected_changed_fraction=(0.70, 1.0),
+    ),
+    ProposalDefinition(
+        operation_id="cinematic_grade",
+        instruction=(
+            "Apply a subtle cinematic color grade while preserving all objects, layout, "
+            "and identity."
+        ),
+        family="style",
+        difficulty=2,
+        scope="global",
+        metric="internal_prompt_gain",
+        direction="increase",
+        target=0.0,
+        expected_changed_fraction=(0.20, 0.85),
+        verifier="internal",
+    ),
+    ProposalDefinition(
+        operation_id="background_blur",
+        instruction=(
+            "Slightly blur the background while keeping the main subject sharp, natural, "
+            "and unchanged."
+        ),
+        family="background",
+        difficulty=3,
+        scope="local",
+        metric="internal_prompt_gain",
+        direction="increase",
+        target=0.0,
+        expected_changed_fraction=(0.08, 0.55),
+        verifier="internal",
+    ),
+    ProposalDefinition(
+        operation_id="subject_pop",
+        instruction=(
+            "Make the main subject stand out with subtly stronger local contrast while "
+            "preserving the rest of the image."
+        ),
+        family="local",
+        difficulty=3,
+        scope="local",
+        metric="internal_prompt_gain",
+        direction="increase",
+        target=0.0,
+        expected_changed_fraction=(0.08, 0.50),
+        verifier="internal",
+    ),
+    ProposalDefinition(
+        operation_id="detail_sharpen",
+        instruction=(
+            "Sharpen the important subject details slightly without changing the scene "
+            "content, colors, or composition."
+        ),
+        family="detail",
+        difficulty=2,
+        scope="local",
+        metric="internal_prompt_gain",
+        direction="increase",
+        target=0.0,
+        expected_changed_fraction=(0.04, 0.45),
+        verifier="internal",
     ),
 ]
 

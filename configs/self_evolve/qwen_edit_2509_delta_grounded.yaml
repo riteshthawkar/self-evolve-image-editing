@@ -1,4 +1,4 @@
-name: self_evolve_qwen_edit_2509_spatial
+name: self_evolve_qwen_edit_2509_delta_grounded
 runtime:
   seed: 123
   dry_run: false
@@ -9,12 +9,16 @@ dataset:
   limit: null
 proposer:
   backend: scripted
+  family_policy: metadata_preferred
   families:
     - exposure
     - color
     - contrast
     - tone
     - style
+    - background
+    - local
+    - detail
 editor:
   backend: qwen_edit
   device: auto
@@ -35,18 +39,37 @@ editor:
     torch_dtype: bfloat16
     local_files_only: false
     model_id_with_origin_paths: Qwen/Qwen-Image-Edit-2509:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors
+candidate_generation:
+  samples_per_proposal: 4
+  seed_stride: 7919
 solver:
-  backend: hybrid
+  backend: hard_gated_relative
   global_weight: 0.7
   local_weight: 0.3
-  proxy_weight: 0.8
-  spatial_weight: 0.2
+  proxy_weight: 0.50
+  spatial_weight: 0.20
   cycle_weight: 0.0
-  internal_weight: 0.0
+  internal_weight: 0.30
+  internal_instruction_weight: 0.70
+  internal_prompt_gain_scale: 0.08
+  internal_neutral_score: 0.35
   acceptance_threshold: 0.72
+  instruction_threshold: 0.62
+  preservation_threshold: 0.68
+  quality_threshold: 0.50
+  max_disagreement: 0.35
+  top_m: 1
+  counterfactual_distractors: 3
+  counterfactual_backend: auto
+  counterfactual_prompt_gain_scale: 0.08
+  rank_spatial_weight: 0.30
+  rank_counterfactual_weight: 0.30
+  rank_relative_weight: 0.25
+  rank_cycle_weight: 0.00
+  rank_internal_weight: 0.15
 curriculum:
   num_rounds: 3
-  proposals_per_image: 1
+  proposals_per_image: 2
   initial_level: 1
   min_level: 1
   max_level: 3
@@ -60,6 +83,7 @@ training:
   reconstruction_replay_ratio: 0.15
   reconstruction_replay_prompt: Reconstruct the input image exactly. Preserve all content, layout, colors, and text.
 output:
-  root_dir: outputs/self_evolve/qwen_edit_2509_spatial
-  save_all_candidates: false
+  root_dir: outputs/self_evolve/qwen_edit_2509_delta_grounded
+  save_all_candidates: true
   use_cumulative_manifest: true
+  write_evaluator_training: true

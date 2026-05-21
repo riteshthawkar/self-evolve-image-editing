@@ -17,7 +17,7 @@ export HF_HOME="${HF_HOME:-${SCRATCH:-$PWD/.cache}/huggingface}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export TOKENIZERS_PARALLELISM=false
 
-TRAIN_MANIFEST="${TRAIN_MANIFEST:?Set TRAIN_MANIFEST, for example outputs/self_evolve/<run>/delta-ranker/round_03/train_manifest.json}"
+TRAIN_MANIFEST="${TRAIN_MANIFEST:?Set TRAIN_MANIFEST, for example outputs/self_evolve/<run>/delta-results/round_02/train_manifest.json}"
 RUN_NAME="${RUN_NAME:-self_evolve_lora_$(date +%Y%m%d_%H%M%S)}"
 EPOCHS="${EPOCHS:-3}"
 MAX_PIXELS="${MAX_PIXELS:-1048576}"

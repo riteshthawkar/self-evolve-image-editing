@@ -82,6 +82,9 @@ class SelfEvolveRunner:
                 "difficulty_level": proposal.difficulty_level,
                 "instruction": proposal.instruction,
                 "scope": proposal.definition.scope,
+                "metric": proposal.definition.metric,
+                "verifier": proposal.definition.verifier,
+                "inverse_operation_id": proposal.definition.inverse_operation_id,
             },
             "status": status,
             "edited_image_path": relative_to_repo(image_path) if image_path is not None else None,
@@ -97,10 +100,24 @@ class SelfEvolveRunner:
             }
         return payload
 
-    def _write_manifest(self, accepted: list[AcceptedSample], manifest_path: Path) -> Path:
+    def _write_manifest(self, accepted: list[AcceptedSample], manifest_path: Path) -> tuple[Path, int]:
+        allowed_verifiers = self.config.get("output", {}).get("train_verifiers")
+        allowed_verifier_set = set(allowed_verifiers) if allowed_verifiers else None
+        training_cfg = self.config.get("training", {})
+        replay_ratio = float(training_cfg.get("reconstruction_replay_ratio", 0.0))
+        replay_prompt = str(
+            training_cfg.get(
+                "reconstruction_replay_prompt",
+                "Reconstruct the input image exactly. Preserve all content, layout, colors, and text.",
+            )
+        )
         manifest_records = []
         accepted_records = []
+        replay_source_paths: list[Path] = []
         for sample in accepted:
+            if allowed_verifier_set is not None and sample.proposal.definition.verifier not in allowed_verifier_set:
+                continue
+            replay_source_paths.append(sample.record.image_path)
             manifest_records.append(
                 {
                     "prompt": sample.proposal.instruction,
@@ -125,9 +142,29 @@ class SelfEvolveRunner:
                     },
                 }
             )
+        if replay_ratio > 0 and manifest_records and replay_source_paths:
+            replay_count = max(1, round(len(manifest_records) * replay_ratio))
+            unique_sources = list(dict.fromkeys(replay_source_paths))
+            for index in range(replay_count):
+                source_path = unique_sources[index % len(unique_sources)]
+                manifest_records.append(
+                    {
+                        "prompt": replay_prompt,
+                        "image": relative_to_repo(source_path),
+                        "edit_image": relative_to_repo(source_path),
+                    }
+                )
+                accepted_records.append(
+                    {
+                        "type": "reconstruction_replay",
+                        "original_image": relative_to_repo(source_path),
+                        "edited_image": relative_to_repo(source_path),
+                        "instruction": replay_prompt,
+                    }
+                )
         save_json(manifest_records, manifest_path)
         write_jsonl(accepted_records, manifest_path.with_suffix(".jsonl"))
-        return manifest_path
+        return manifest_path, len(manifest_records)
 
     def _run_training_round(self, round_index: int, round_dir: Path, manifest_path: Path) -> dict[str, Any] | None:
         training_cfg = self.config.get("training", {})
@@ -252,6 +289,11 @@ class SelfEvolveRunner:
                         f"{record.key}__r{round_index:02d}__p{proposal.proposal_index:02d}"
                         f"__{proposal.definition.operation_id}"
                     )
+                    distractors = (
+                        self.solver.describe_distractors(proposal)
+                        if hasattr(self.solver, "describe_distractors")
+                        else []
+                    )
                     if self.dry_run:
                         for candidate_index in range(samples_per_proposal):
                             candidate_payloads.append(
@@ -331,6 +373,9 @@ class SelfEvolveRunner:
                                     "edited_image": relative_to_repo(image_path) if image_path is not None else None,
                                     "instruction": proposal.instruction,
                                     "operation_id": proposal.definition.operation_id,
+                                    "family": proposal.definition.family,
+                                    "verifier": proposal.definition.verifier,
+                                    "distractors": distractors,
                                     "accepted": solver_result.accepted,
                                     "feasible": bool(solver_result.signals.get("feasible", float(solver_result.accepted))),
                                     "rank": int(solver_result.signals.get("feasible_rank", 0.0)),
@@ -353,7 +398,15 @@ class SelfEvolveRunner:
                                     "group_id": group_id,
                                     "winner_candidate_index": winner["candidate_index"],
                                     "loser_candidate_index": loser["candidate_index"],
+                                    "record_key": record.key,
+                                    "source_image": relative_to_repo(record.image_path),
                                     "instruction": proposal.instruction,
+                                    "operation_id": proposal.definition.operation_id,
+                                    "family": proposal.definition.family,
+                                    "verifier": proposal.definition.verifier,
+                                    "distractors": distractors,
+                                    "winner_image": winner.get("edited_image_path"),
+                                    "loser_image": loser.get("edited_image_path"),
                                     "winner_score": winner.get("solver", {}).get("total_score"),
                                     "loser_score": loser.get("solver", {}).get("total_score"),
                                 }
@@ -368,7 +421,7 @@ class SelfEvolveRunner:
             manifest_path = round_dir / "train_manifest.json"
             cumulative_accepted.extend(accepted)
             manifest_samples = cumulative_accepted if use_cumulative_manifest else accepted
-            self._write_manifest(manifest_samples, manifest_path)
+            _, train_manifest_sample_count = self._write_manifest(manifest_samples, manifest_path)
 
             accepted_scores = [sample.solver_result.total_score for sample in accepted]
             global_scores = [sample.solver_result.global_score for sample in accepted]
@@ -390,6 +443,7 @@ class SelfEvolveRunner:
                 "candidates": total_candidates,
                 "accepted": len(accepted),
                 "cumulative_accepted": len(cumulative_accepted),
+                "train_manifest_samples": train_manifest_sample_count,
                 "acceptance_rate": acceptance_rate,
                 "avg_total_score": (sum(accepted_scores) / len(accepted_scores)) if accepted_scores else 0.0,
                 "avg_global_score": (sum(global_scores) / len(global_scores)) if global_scores else 0.0,

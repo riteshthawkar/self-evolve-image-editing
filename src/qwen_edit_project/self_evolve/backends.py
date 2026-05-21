@@ -38,6 +38,7 @@ INVERSE_OPERATION_MAP = {
     "warm_tone": "cool_tone",
     "cool_tone": "warm_tone",
 }
+INTERNAL_ONLY_METRICS = {"internal_prompt_gain", "semantic"}
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -82,7 +83,9 @@ def _apply_pillow_operation(image: Image.Image, operation_id: str) -> Image.Imag
 
 
 def _reverse_proposal(proposal: EditProposal) -> EditProposal | None:
-    inverse_operation_id = INVERSE_OPERATION_MAP.get(proposal.definition.operation_id)
+    inverse_operation_id = proposal.definition.inverse_operation_id or INVERSE_OPERATION_MAP.get(
+        proposal.definition.operation_id
+    )
     if inverse_operation_id is None:
         return None
     inverse_definition = PROPOSAL_BY_ID[inverse_operation_id]
@@ -115,6 +118,28 @@ class DifficultyController:
 class ScriptedProposer:
     def __init__(self, config: dict[str, Any]):
         self.families = config.get("families")
+        self.operation_ids = config.get("operation_ids")
+        self.family_policy = config.get("family_policy", "random")
+
+    @staticmethod
+    def _metadata_family_preferences(record: UnlabeledImageRecord) -> tuple[list[str], list[str]]:
+        raw_families = record.metadata.get("edit_families") or record.metadata.get("families") or []
+        if isinstance(raw_families, str):
+            raw_families = [part.strip() for part in raw_families.split(",")]
+        primary_family = record.metadata.get("primary_family")
+        primary = []
+        if isinstance(primary_family, str) and primary_family:
+            primary.append(primary_family)
+        families = [*primary]
+        if isinstance(raw_families, list):
+            families.extend(str(item) for item in raw_families if item)
+        seen = set()
+        ordered = []
+        for family in families:
+            if family not in seen:
+                seen.add(family)
+                ordered.append(family)
+        return primary, ordered
 
     def propose(
         self,
@@ -125,11 +150,28 @@ class ScriptedProposer:
         seed: int,
     ) -> list[EditProposal]:
         candidates = available_proposals(difficulty_level, families=self.families)
+        if self.operation_ids:
+            operation_filter = set(self.operation_ids)
+            candidates = [candidate for candidate in candidates if candidate.operation_id in operation_filter]
         if not candidates:
             return []
         stable_key_seed = sum(ord(char) for char in record.key)
         rng = random.Random(seed + round_index * 100_003 + stable_key_seed)
-        if proposals_per_image >= len(candidates):
+        primary_families, metadata_families = self._metadata_family_preferences(record)
+        metadata_family_set = set(metadata_families)
+        if self.family_policy == "metadata_preferred" and metadata_family_set:
+            primary = [candidate for candidate in candidates if candidate.family in set(primary_families)]
+            preferred = [
+                candidate
+                for candidate in candidates
+                if candidate.family in metadata_family_set and candidate.family not in set(primary_families)
+            ]
+            fallback = [candidate for candidate in candidates if candidate.family not in metadata_family_set]
+            rng.shuffle(primary)
+            rng.shuffle(preferred)
+            rng.shuffle(fallback)
+            selected = (primary + preferred + fallback)[:proposals_per_image]
+        elif proposals_per_image >= len(candidates):
             selected = candidates[:]
             rng.shuffle(selected)
         else:
@@ -210,13 +252,20 @@ class QwenEditEditor:
             device=self.device,
             processor_model_id=model_cfg.get("processor_model_id", "Qwen/Qwen-Image-Edit"),
             torch_dtype=model_cfg.get("torch_dtype", "auto"),
+            backend=model_cfg.get("backend", "diffsynth"),
+            base_model=model_cfg.get("base_model"),
+            local_files_only=bool(model_cfg.get("local_files_only", False)),
         )
         return self.pipeline
 
     def edit_image(self, image: Image.Image, instruction: str, operation_id: str | None = None) -> Image.Image:
         pipeline = self._ensure_pipeline()
         generation = dict(self.generation)
-        generation["width"], generation["height"] = image.size
+        if bool(generation.get("preserve_input_resolution", True)):
+            generation["width"], generation["height"] = image.size
+        else:
+            generation.pop("width", None)
+            generation.pop("height", None)
         prompt = polish_prompt(instruction, use_prompt_polish=False, image_context=image)
         output = render_edit(pipeline, prompt, [image.convert("RGB")], generation)
         return output.images[0] if hasattr(output, "images") else output
@@ -245,6 +294,17 @@ class StatSolver:
         self.acceptance_threshold = float(config.get("acceptance_threshold", 0.72))
 
     def _global_score(self, definition: ProposalDefinition, original: Image.Image, edited: Image.Image) -> tuple[float, dict[str, float]]:
+        if definition.metric in INTERNAL_ONLY_METRICS or definition.verifier == "internal":
+            return 0.5, {
+                "global_proxy_supported": 0.0,
+                "internal_metric_required": 1.0,
+                "luminance_delta": 0.0,
+                "contrast_delta": 0.0,
+                "saturation_delta": 0.0,
+                "warmth_delta": 0.0,
+                "saturation_level": 0.0,
+            }
+
         original_luminance = luminance_mean(original)
         edited_luminance = luminance_mean(edited)
         original_contrast = luminance_std(original)
@@ -285,6 +345,8 @@ class StatSolver:
             raise ValueError(f"Unsupported solver direction: {definition.direction}")
 
         return score, {
+            "global_proxy_supported": 1.0,
+            "internal_metric_required": 0.0,
             "luminance_delta": deltas["luminance_delta"],
             "contrast_delta": deltas["contrast_delta"],
             "saturation_delta": deltas["saturation_delta"],
@@ -512,6 +574,116 @@ class MultiSignalSolver(StatSolver):
         )
 
 
+class GenericRelativeSelfRewardEvaluator(MultiSignalSolver):
+    """Generic self-evolution baseline without editing-specific delta gates.
+
+    This intentionally mirrors the kind of continuous self-reward transplant that works for
+    reasoning-style proposer/solver loops but is under-specified for image editing. It ranks K
+    candidates by a scalar self-reward and relative group score, without enforcing preservation,
+    counterfactual instruction discrimination, or hard edit-success gates.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        super().__init__(config)
+        self.top_m = int(config.get("top_m", 1))
+        self.quality_threshold = float(config.get("quality_threshold", self.acceptance_threshold))
+        self.rank_self_reward_weight = float(config.get("rank_self_reward_weight", 0.70))
+        self.rank_relative_weight = float(config.get("rank_relative_weight", 0.30))
+
+    @staticmethod
+    def _weighted_mean(weighted_values: list[tuple[float, float]], default: float = 0.0) -> float:
+        total_weight = sum(weight for _, weight in weighted_values if weight > 0.0)
+        if total_weight <= 0.0:
+            return default
+        return sum(value * weight for value, weight in weighted_values if weight > 0.0) / total_weight
+
+    def score_group(
+        self,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited_candidates: list[Image.Image],
+        editor: Any | None = None,
+    ) -> list[SolverResult]:
+        if not edited_candidates:
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for candidate_index, edited in enumerate(edited_candidates):
+            result = super().score(proposal, original, edited, editor=editor)
+            rows.append(
+                {
+                    "candidate_index": candidate_index,
+                    "result": result,
+                    "self_reward_score": result.total_score,
+                }
+            )
+
+        base_scores = [row["self_reward_score"] for row in rows]
+        min_base = min(base_scores)
+        max_base = max(base_scores)
+        value_range = max(max_base - min_base, 1e-6)
+        for row in rows:
+            relative_score = (
+                (row["self_reward_score"] - min_base) / value_range if max_base > min_base else 0.5
+            )
+            quality_score = self._weighted_mean(
+                [
+                    (row["self_reward_score"], self.rank_self_reward_weight),
+                    (relative_score, self.rank_relative_weight),
+                ],
+                default=row["self_reward_score"],
+            )
+            row["relative_score"] = relative_score
+            row["quality_score"] = quality_score
+
+        ranked_rows = sorted(rows, key=lambda row: row["quality_score"], reverse=True)
+        accepted_candidate_indices = {
+            row["candidate_index"]
+            for row in ranked_rows[: self.top_m]
+            if row["quality_score"] >= self.quality_threshold
+        }
+        rank_by_candidate = {row["candidate_index"]: rank + 1 for rank, row in enumerate(ranked_rows)}
+
+        outputs: list[SolverResult] = []
+        for row in rows:
+            result = row["result"]
+            candidate_index = row["candidate_index"]
+            accepted = candidate_index in accepted_candidate_indices
+            component_scores = dict(result.component_scores)
+            component_scores.update(
+                {
+                    "generic_self_reward_score": row["self_reward_score"],
+                    "relative_group_score": row["relative_score"],
+                    "relative_quality_score": row["quality_score"],
+                }
+            )
+            signals = dict(result.signals)
+            signals.update(
+                {
+                    "candidate_index": float(candidate_index),
+                    "group_size": float(len(rows)),
+                    "feasible": 1.0,
+                    "accepted_by_generic_ranker": 1.0 if accepted else 0.0,
+                    "generic_rank": float(rank_by_candidate.get(candidate_index, 0)),
+                    "generic_self_reward_threshold": self.quality_threshold,
+                    "delta_instruction_gate_used": 0.0,
+                    "delta_preservation_gate_used": 0.0,
+                    "counterfactual_gate_used": 0.0,
+                }
+            )
+            outputs.append(
+                SolverResult(
+                    global_score=result.global_score,
+                    local_score=result.local_score,
+                    total_score=row["quality_score"],
+                    accepted=accepted,
+                    component_scores=component_scores,
+                    signals=signals,
+                )
+            )
+        return outputs
+
+
 class HardGatedRelativeEvaluator(MultiSignalSolver):
     """Evaluator for the research-grade delta-grounded candidate-ranking path."""
 
@@ -528,10 +700,15 @@ class HardGatedRelativeEvaluator(MultiSignalSolver):
         self.rank_relative_weight = float(config.get("rank_relative_weight", 0.25))
         self.rank_cycle_weight = float(config.get("rank_cycle_weight", 0.05))
         self.rank_internal_weight = float(config.get("rank_internal_weight", 0.05))
+        self.counterfactual_backend = config.get("counterfactual_backend", "auto")
+        self.counterfactual_prompt_gain_scale = float(config.get("counterfactual_prompt_gain_scale", 0.08))
+        self.require_internal_when_weighted = bool(config.get("require_internal_when_weighted", False))
 
     def _distractor_definitions(self, proposal: EditProposal) -> list[ProposalDefinition]:
         chosen: list[ProposalDefinition] = []
-        inverse_id = INVERSE_OPERATION_MAP.get(proposal.definition.operation_id)
+        inverse_id = proposal.definition.inverse_operation_id or INVERSE_OPERATION_MAP.get(
+            proposal.definition.operation_id
+        )
         if inverse_id is not None:
             chosen.append(PROPOSAL_BY_ID[inverse_id])
         for definition in PROPOSAL_BANK:
@@ -546,7 +723,51 @@ class HardGatedRelativeEvaluator(MultiSignalSolver):
                 chosen.append(definition)
         return chosen[: self.counterfactual_distractors]
 
-    def _counterfactual_score(
+    def describe_distractors(self, proposal: EditProposal) -> list[dict[str, Any]]:
+        return [
+            {
+                "operation_id": definition.operation_id,
+                "family": definition.family,
+                "instruction": definition.instruction,
+                "verifier": definition.verifier,
+            }
+            for definition in self._distractor_definitions(proposal)
+        ]
+
+    def _qwen_prompt_gain(
+        self,
+        instruction: str,
+        original: Image.Image,
+        edited: Image.Image,
+        editor: Any | None,
+    ) -> float | None:
+        if not isinstance(editor, QwenEditEditor):
+            return None
+        try:
+            import torch
+            import torch.nn.functional as F
+
+            pipe = editor._ensure_pipeline()
+            prompt = polish_prompt(instruction, use_prompt_polish=False, image_context=original)
+            with torch.no_grad():
+                text_feature = extract_qwen_text_features(pipe, prompt)["pooled_embedding"][0].float()
+                original_feature = extract_qwen_edit_understanding_features(
+                    pipe, prompt, [original]
+                )["pooled_embedding"][0].float()
+                edited_feature = extract_qwen_edit_understanding_features(
+                    pipe, prompt, [edited]
+                )["pooled_embedding"][0].float()
+            original_similarity = float(
+                F.cosine_similarity(original_feature.unsqueeze(0), text_feature.unsqueeze(0)).item()
+            )
+            edited_similarity = float(
+                F.cosine_similarity(edited_feature.unsqueeze(0), text_feature.unsqueeze(0)).item()
+            )
+            return edited_similarity - original_similarity
+        except Exception:
+            return None
+
+    def _proxy_counterfactual_score(
         self,
         proposal: EditProposal,
         original: Image.Image,
@@ -561,10 +782,64 @@ class HardGatedRelativeEvaluator(MultiSignalSolver):
         margin = true_score - max_distractor
         score = _clamp(0.5 + 0.5 * margin)
         return score, {
+            "counterfactual_backend_proxy": 1.0,
+            "counterfactual_backend_internal": 0.0,
             "counterfactual_true_score": true_score,
             "counterfactual_max_distractor_score": max_distractor,
             "counterfactual_margin": margin,
         }
+
+    def _internal_counterfactual_score(
+        self,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        editor: Any | None,
+    ) -> tuple[float, dict[str, float]] | None:
+        true_gain = self._qwen_prompt_gain(proposal.instruction, original, edited, editor)
+        if true_gain is None:
+            return None
+        distractor_gains = []
+        for definition in self._distractor_definitions(proposal):
+            gain = self._qwen_prompt_gain(definition.instruction, original, edited, editor)
+            if gain is not None:
+                distractor_gains.append(gain)
+        max_distractor_gain = max(distractor_gains) if distractor_gains else 0.0
+        margin = true_gain - max_distractor_gain
+        score = _clamp(0.5 + 0.5 * margin / max(self.counterfactual_prompt_gain_scale, 1e-6))
+        return score, {
+            "counterfactual_backend_proxy": 0.0,
+            "counterfactual_backend_internal": 1.0,
+            "counterfactual_true_score": true_gain,
+            "counterfactual_max_distractor_score": max_distractor_gain,
+            "counterfactual_margin": margin,
+            "counterfactual_distractor_count": float(len(distractor_gains)),
+        }
+
+    def _counterfactual_score(
+        self,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        editor: Any | None = None,
+    ) -> tuple[float, dict[str, float]]:
+        use_internal = self.counterfactual_backend == "internal" or (
+            self.counterfactual_backend == "auto" and proposal.definition.verifier == "internal"
+        )
+        if use_internal:
+            internal_result = self._internal_counterfactual_score(proposal, original, edited, editor)
+            if internal_result is not None:
+                return internal_result
+            if self.counterfactual_backend in {"auto", "internal"}:
+                return 0.5, {
+                    "counterfactual_backend_proxy": 0.0,
+                    "counterfactual_backend_internal": 0.0,
+                    "counterfactual_true_score": 0.0,
+                    "counterfactual_max_distractor_score": 0.0,
+                    "counterfactual_margin": 0.0,
+                    "counterfactual_runtime_error": 1.0,
+                }
+        return self._proxy_counterfactual_score(proposal, original, edited)
 
     @staticmethod
     def _weighted_mean(weighted_values: list[tuple[float, float]], default: float = 0.0) -> float:
@@ -581,8 +856,16 @@ class HardGatedRelativeEvaluator(MultiSignalSolver):
 
     def _gate_scores(self, result: SolverResult) -> tuple[float, float]:
         instruction = result.global_score
-        if "internal_instruction_score" in result.signals:
+        if result.signals.get("global_proxy_supported", 1.0) <= 0.0:
+            instruction = result.signals.get("internal_instruction_score", result.global_score)
+        elif "internal_instruction_score" in result.signals:
             instruction = 0.70 * result.global_score + 0.30 * result.signals["internal_instruction_score"]
+        if (
+            self.require_internal_when_weighted
+            and (self.internal_weight > 0.0 or self.rank_internal_weight > 0.0)
+            and result.signals.get("internal_supported", 0.0) <= 0.0
+        ):
+            instruction = 0.0
         outside_preservation = result.signals.get("spatial_outside_preservation", result.local_score)
         edge_preservation = result.signals.get("edge_preservation_score", result.local_score)
         preservation = 0.55 * edge_preservation + 0.45 * outside_preservation
@@ -615,7 +898,9 @@ class HardGatedRelativeEvaluator(MultiSignalSolver):
         rows: list[dict[str, Any]] = []
         for candidate_index, edited in enumerate(edited_candidates):
             result = super().score(proposal, original, edited, editor=editor)
-            counterfactual_score, counterfactual_signals = self._counterfactual_score(proposal, original, edited)
+            counterfactual_score, counterfactual_signals = self._counterfactual_score(
+                proposal, original, edited, editor=editor
+            )
             instruction_score, preservation_score = self._gate_scores(result)
             rank_base_score = self._rank_base_score(result, counterfactual_score)
             feasible = instruction_score >= self.instruction_threshold and preservation_score >= self.preservation_threshold
@@ -751,6 +1036,15 @@ def build_solver(config: dict[str, Any]):
         return MultiSignalSolver(solver_config)
     if backend == "hybrid":
         return MultiSignalSolver(config)
+    if backend in {"generic_relative_self_reward", "evolmm_style"}:
+        solver_config = dict(config)
+        solver_config.setdefault("global_weight", 1.0)
+        solver_config.setdefault("local_weight", 0.0)
+        solver_config.setdefault("proxy_weight", 1.0)
+        solver_config.setdefault("spatial_weight", 0.0)
+        solver_config.setdefault("cycle_weight", 0.0)
+        solver_config.setdefault("internal_weight", 0.0)
+        return GenericRelativeSelfRewardEvaluator(solver_config)
     if backend in {"hard_gated_relative", "delta_ranker"}:
         solver_config = dict(config)
         solver_config.setdefault("spatial_weight", 0.20)

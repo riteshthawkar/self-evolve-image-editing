@@ -18,15 +18,16 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export TOKENIZERS_PARALLELISM=false
 
 MANIFEST="${MANIFEST:-data/unlabeled/splits/coco2017/main_manifest.jsonl}"
-RUN_NAME="${RUN_NAME:-delta_ranker_main_$(date +%Y%m%d_%H%M%S)}"
-LIMIT="${LIMIT:-256}"
-SAMPLES_PER_PROPOSAL="${SAMPLES_PER_PROPOSAL:-2}"
-MAX_RECORDS_PER_ROUND="${MAX_RECORDS_PER_ROUND:-256}"
-NUM_ROUNDS="${NUM_ROUNDS:-3}"
+RUN_NAME="${RUN_NAME:-delta_results_main_$(date +%Y%m%d_%H%M%S)}"
+LIMIT="${LIMIT:-512}"
+SAMPLES_PER_PROPOSAL="${SAMPLES_PER_PROPOSAL:-4}"
+MAX_RECORDS_PER_ROUND="${MAX_RECORDS_PER_ROUND:-512}"
+NUM_ROUNDS="${NUM_ROUNDS:-2}"
 DTYPE="${DTYPE:-bfloat16}"
+VARIANT="${VARIANT:-delta-results}"
 
 bash scripts/run_self_evolve_matrix.sh \
-  --variant delta-ranker \
+  --variant "$VARIANT" \
   --dtype "$DTYPE" \
   --limit "$LIMIT" \
   --output-prefix "outputs/self_evolve/$RUN_NAME" \

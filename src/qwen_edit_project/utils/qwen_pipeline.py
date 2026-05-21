@@ -234,7 +234,14 @@ def _extract_masked_hidden_states(hidden_states, attention_mask):
     return torch.split(selected, valid_lengths.tolist(), dim=0)
 
 
-def _build_qwen_edit_prompt(prompt: str, num_images: int) -> tuple[str, int]:
+def _build_qwen_edit_prompt(pipe: Any, prompt: str, num_images: int) -> tuple[str, int]:
+    if hasattr(pipe, "prompt_template_encode") and hasattr(pipe, "prompt_template_encode_start_idx"):
+        image_slots = "".join(
+            f"Picture {index + 1}: <|vision_start|><|image_pad|><|vision_end|>"
+            for index in range(num_images)
+        )
+        return pipe.prompt_template_encode.format(image_slots + prompt), int(pipe.prompt_template_encode_start_idx)
+
     template = (
         "<|im_start|>system\n"
         "Describe the key features of the input image (color, shape, size, texture, objects, background), "
@@ -242,14 +249,11 @@ def _build_qwen_edit_prompt(prompt: str, num_images: int) -> tuple[str, int]:
         "that meets the user's requirements while maintaining consistency with the original input where appropriate."
         "<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
     )
-    if num_images == 1:
-        user_content = f"<|vision_start|><|image_pad|><|vision_end|>{prompt}"
-    else:
-        image_slots = "".join(
-            f"Picture {index + 1}: <|vision_start|><|image_pad|><|vision_end|>"
-            for index in range(num_images)
-        )
-        user_content = f"{image_slots}{prompt}"
+    image_slots = "".join(
+        f"Picture {index + 1}: <|vision_start|><|image_pad|><|vision_end|>"
+        for index in range(num_images)
+    )
+    user_content = f"{image_slots}{prompt}"
     return template.format(user_content), 64
 
 
@@ -300,20 +304,29 @@ def extract_qwen_edit_understanding_features(
     image_list = images if isinstance(images, list) else [images]
     processor_images = image_list if len(image_list) == 1 else [_resize_for_qwen_edit_understanding(image) for image in image_list]
     processor_input = processor_images[0] if len(processor_images) == 1 else processor_images
-    text, drop_idx = _build_qwen_edit_prompt(prompt, len(image_list))
-    model_inputs = pipe.processor(text=[text], images=processor_input, padding=True, return_tensors="pt").to(pipe.device)
-    hidden_states = pipe.text_encoder(
+    text, drop_idx = _build_qwen_edit_prompt(pipe, prompt, len(image_list))
+    device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
+    dtype = getattr(pipe, "torch_dtype", getattr(getattr(pipe, "text_encoder", None), "dtype", None))
+    model_inputs = pipe.processor(text=[text], images=processor_input, padding=True, return_tensors="pt").to(device)
+    outputs = pipe.text_encoder(
         input_ids=model_inputs.input_ids,
         attention_mask=model_inputs.attention_mask,
         pixel_values=model_inputs.pixel_values,
         image_grid_thw=model_inputs.image_grid_thw,
         output_hidden_states=True,
-    )[-1]
+    )
+    hidden_states = outputs.hidden_states[-1] if hasattr(outputs, "hidden_states") else outputs[-1]
+    if isinstance(hidden_states, (tuple, list)):
+        hidden_states = hidden_states[-1]
     split_hidden_states = _extract_masked_hidden_states(hidden_states, model_inputs.attention_mask)
     trimmed_states = [state[drop_idx:] for state in split_hidden_states]
     token_embeddings, attention_mask, pooled_embedding = _pool_hidden_states(trimmed_states)
-    token_embeddings = token_embeddings.to(dtype=pipe.torch_dtype, device=pipe.device)
-    pooled_embedding = pooled_embedding.to(dtype=pipe.torch_dtype, device=pipe.device)
+    if dtype is not None:
+        token_embeddings = token_embeddings.to(dtype=dtype, device=device)
+        pooled_embedding = pooled_embedding.to(dtype=dtype, device=device)
+    else:
+        token_embeddings = token_embeddings.to(device=device)
+        pooled_embedding = pooled_embedding.to(device=device)
     return {
         "token_embeddings": token_embeddings,
         "attention_mask": attention_mask,
@@ -337,17 +350,26 @@ def extract_qwen_text_features(
         raise ValueError("Qwen text features require a pipeline with both tokenizer or processor.tokenizer and text_encoder.")
 
     text, drop_idx = _build_qwen_text_prompt(prompt)
-    model_inputs = tokenizer([text], padding=True, return_tensors="pt").to(pipe.device)
-    hidden_states = pipe.text_encoder(
+    device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
+    dtype = getattr(pipe, "torch_dtype", getattr(getattr(pipe, "text_encoder", None), "dtype", None))
+    model_inputs = tokenizer([text], padding=True, return_tensors="pt").to(device)
+    outputs = pipe.text_encoder(
         input_ids=model_inputs.input_ids,
         attention_mask=model_inputs.attention_mask,
         output_hidden_states=True,
-    )[-1]
+    )
+    hidden_states = outputs.hidden_states[-1] if hasattr(outputs, "hidden_states") else outputs[-1]
+    if isinstance(hidden_states, (tuple, list)):
+        hidden_states = hidden_states[-1]
     split_hidden_states = _extract_masked_hidden_states(hidden_states, model_inputs.attention_mask)
     trimmed_states = [state[drop_idx:] if state.size(0) > drop_idx else state for state in split_hidden_states]
     token_embeddings, attention_mask, pooled_embedding = _pool_hidden_states(trimmed_states)
-    token_embeddings = token_embeddings.to(dtype=pipe.torch_dtype, device=pipe.device)
-    pooled_embedding = pooled_embedding.to(dtype=pipe.torch_dtype, device=pipe.device)
+    if dtype is not None:
+        token_embeddings = token_embeddings.to(dtype=dtype, device=device)
+        pooled_embedding = pooled_embedding.to(dtype=dtype, device=device)
+    else:
+        token_embeddings = token_embeddings.to(device=device)
+        pooled_embedding = pooled_embedding.to(device=device)
     return {
         "token_embeddings": token_embeddings,
         "attention_mask": attention_mask,

@@ -24,6 +24,8 @@ class ProposalDefinition:
     direction: str
     target: float
     expected_changed_fraction: tuple[float, float]
+    verifier: str = "proxy"
+    inverse_operation_id: str | None = None
 
 
 @dataclass
