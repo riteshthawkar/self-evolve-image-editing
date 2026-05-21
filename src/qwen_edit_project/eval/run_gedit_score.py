@@ -13,7 +13,32 @@ from qwen_edit_project.utils.run_metadata import base_run_metadata, utc_timestam
 
 
 def ensure_secret_env(secret_path: Path, target_path: Path) -> None:
-    target_path.write_text(secret_path.read_text(encoding="utf-8"), encoding="utf-8")
+    secret_text = secret_path.read_text(encoding="utf-8").strip()
+    if "OPENAI_API_KEY=" in secret_text:
+        raise ValueError(
+            "GEdit's upstream VIEScore reader expects secret.env to contain only the raw OpenAI API key, "
+            "not a dotenv assignment. Put the key as a single line like: sk-proj-..."
+        )
+    target_path.write_text(secret_text + "\n", encoding="utf-8")
+
+
+def validate_expected_openai_model(config: dict, gedit_root: Path) -> None:
+    expected_model = config["scoring"].get("expected_openai_model")
+    if not expected_model:
+        return
+    if config["scoring"].get("backbone", "gpt4o") != "gpt4o":
+        return
+    viescore_init = gedit_root / "viescore" / "__init__.py"
+    if not viescore_init.exists():
+        raise FileNotFoundError(f"Cannot validate GEdit VIEScore model alias: {viescore_init} is missing")
+    source = viescore_init.read_text(encoding="utf-8")
+    expected_fragment = f'model_name="{expected_model}"'
+    if expected_fragment not in source and f"model_name='{expected_model}'" not in source:
+        raise RuntimeError(
+            "GEdit scorer is not paper-matched: config expects backbone=gpt4o to instantiate "
+            f"{expected_model}, but {viescore_init} does not contain {expected_fragment}. "
+            "Update third_party/step1x-edit or override scoring.expected_openai_model only for non-paper runs."
+        )
 
 
 def validate_gedit_export_complete(config: dict, model_dir: Path) -> None:
@@ -62,6 +87,11 @@ def main() -> None:
     validate_gedit_export_complete(config, model_dir)
 
     repo_root = resolve_path(".")
+    gedit_root = resolve_path("third_party/step1x-edit/GEdit-Bench")
+    if gedit_root is None or not gedit_root.exists():
+        raise FileNotFoundError("GEdit scorer repo is missing. Run scripts/bootstrap.sh first.")
+    validate_expected_openai_model(config, gedit_root)
+
     secret_env = os.environ.get("GEDIT_SECRET_ENV_PATH") or config["scoring"].get("scorer_secret_env_path")
     secret_path = resolve_path(secret_env) if secret_env else None
     if secret_path is None or not secret_path.exists():
@@ -71,9 +101,6 @@ def main() -> None:
     had_existing_secret = local_secret.exists()
     original_secret = local_secret.read_text(encoding="utf-8") if had_existing_secret else None
     ensure_secret_env(secret_path, local_secret)
-    gedit_root = resolve_path("third_party/step1x-edit/GEdit-Bench")
-    if gedit_root is None or not gedit_root.exists():
-        raise FileNotFoundError("GEdit scorer repo is missing. Run scripts/bootstrap.sh first.")
     scorer_pythonpath = os.pathsep.join(
         [
             str(gedit_root / "viescore"),
@@ -133,6 +160,10 @@ def main() -> None:
             "score_dir": str(save_dir),
             "score_log": str(log_path),
             "stats_log": str(stats_log),
+            "scoring": {
+                "backbone": config["scoring"].get("backbone", "gpt4o"),
+                "expected_openai_model": config["scoring"].get("expected_openai_model"),
+            },
             "metrics": summarize_gedit(save_dir, model_name, config["scoring"].get("backbone", "gpt4o")),
         },
         save_dir / f"{model_name}_summary.json",

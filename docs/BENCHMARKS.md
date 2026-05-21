@@ -13,8 +13,8 @@ outputs/benchmark_images/gedit/<model_name>/fullset/<task_type>/<language>/<key>
 Examples:
 
 ```text
-outputs/benchmark_images/gedit/qwen_edit_2509_base/fullset/background_change/en/12345.png
-outputs/benchmark_images/gedit/qwen_edit_2509_base/fullset/text_change/cn/67890.png
+outputs/benchmark_images/gedit/qwen_edit_2509_official_diffusers/fullset/background_change/en/12345.png
+outputs/benchmark_images/gedit/qwen_edit_2509_official_diffusers/fullset/text_change/cn/67890.png
 ```
 
 Scoring entry points:
@@ -24,8 +24,12 @@ Scoring entry points:
 
 Important note:
 
+- the Qwen-Image-Edit-2509 paper-matched baseline uses the official Diffusers `QwenImageEditPlusPipeline`, not the legacy DiffSynth edit wrapper
+- the official 2509 generation settings are `bfloat16`, `num_inference_steps=40`, `true_cfg_scale=4.0`, `guidance_scale=1.0`, `negative_prompt=" "`, and `num_images_per_prompt=1`
+- the upstream scorer option is still named `--backbone gpt4o`, but the current upstream `VIEScore` implementation instantiates `model_name="gpt-4.1"` under that alias
 - the upstream scorer currently expects a `secret.env` file via its internal `VIEScore(..., key_path='secret.env')` call
 - the local wrapper copies the configured secret file into the repo root for the scoring run
+- the wrapper refuses to resume into an existing output directory when the recorded export provenance does not match the current paper-matched settings
 
 ### ImgEdit
 
@@ -38,8 +42,8 @@ outputs/benchmark_images/imgedit/<model_name>/<key>.png
 Examples:
 
 ```text
-outputs/benchmark_images/imgedit/qwen_edit_2509_base/1082.png
-outputs/benchmark_images/imgedit/qwen_edit_2509_base/1068.png
+outputs/benchmark_images/imgedit/qwen_edit_2509_official_diffusers/1082.png
+outputs/benchmark_images/imgedit/qwen_edit_2509_official_diffusers/1068.png
 ```
 
 Scoring entry points:

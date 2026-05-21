@@ -6,6 +6,10 @@ from pathlib import Path
 
 from PIL import Image
 
+from qwen_edit_project.eval.export_provenance import (
+    build_edit_export_provenance,
+    validate_resume_provenance,
+)
 from qwen_edit_project.utils.config import load_yaml_config, merge_override, parse_override, save_json
 from qwen_edit_project.utils.paths import ensure_dir, resolve_path
 from qwen_edit_project.utils.prompting import polish_prompt
@@ -43,16 +47,35 @@ def main() -> None:
     if args.limit is not None:
         items = items[: args.limit]
 
+    output_root = ensure_dir(resolve_path(config["output"]["edited_images_dir"])) / model_cfg["model_name"]
+    summary_path = resolve_path(config["output"]["summary_path"])
+    if summary_path is None:
+        raise ValueError("output.summary_path must resolve")
+    actual_summary_path = summary_path.parent / f"{model_cfg['model_name']}_summary.json"
+    export_provenance = build_edit_export_provenance(config)
+    validate_resume_provenance(
+        benchmark="ImgEdit",
+        output_root=output_root,
+        summary_path=actual_summary_path,
+        expected=export_provenance,
+        no_resume=args.no_resume,
+        allow_mismatch=bool(config["output"].get("allow_resume_mismatch", False)),
+    )
+
     pipe = load_qwen_edit_pipeline(
         model_id_with_origin_paths=model_cfg["model_id_with_origin_paths"],
         checkpoint_path=model_cfg.get("checkpoint_path"),
         model_type=model_cfg.get("model_type", "base"),
         device=args.device,
+        processor_model_id=model_cfg.get("processor_model_id", "Qwen/Qwen-Image-Edit"),
         torch_dtype=model_cfg.get("torch_dtype", "auto"),
+        backend=model_cfg.get("backend", "diffsynth"),
+        base_model=model_cfg.get("base_model"),
+        local_files_only=bool(model_cfg.get("local_files_only", False)),
     )
-    output_root = ensure_dir(resolve_path(config["output"]["edited_images_dir"])) / model_cfg["model_name"]
 
     generation = dict(config["generation"])
+    preserve_input_resolution = bool(generation.get("preserve_input_resolution", True))
     written = 0
     skipped = 0
     failed = 0
@@ -68,7 +91,11 @@ def main() -> None:
             use_prompt_polish=config.get("prompting", {}).get("use_prompt_polish", False),
         )
         with Image.open(input_image_path) as image:
-            generation["width"], generation["height"] = image.size
+            if preserve_input_resolution:
+                generation["width"], generation["height"] = image.size
+            else:
+                generation.pop("width", None)
+                generation.pop("height", None)
         try:
             output = render_edit(pipe, prompt, [input_image_path], generation)
             image = output.images[0] if hasattr(output, "images") else output
@@ -102,12 +129,10 @@ def main() -> None:
             "records_requested": len(items),
             "output_root": str(output_root),
             "failures": failures,
+            "export_provenance": export_provenance,
         }
     )
-    summary_path = resolve_path(config["output"]["summary_path"])
-    if summary_path is None:
-        raise ValueError("output.summary_path must resolve")
-    save_json(summary, summary_path.parent / f"{model_cfg['model_name']}_summary.json")
+    save_json(summary, actual_summary_path)
     if failures:
         failure_path = summary_path.parent / f"{model_cfg['model_name']}_export_failures.jsonl"
         with failure_path.open("w", encoding="utf-8") as handle:

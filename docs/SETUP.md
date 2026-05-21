@@ -50,7 +50,8 @@ Training-oriented environment:
 ```bash
 pip install -e ".[vlm]"
 pip install -e third_party/diffsynth-studio
-pip install accelerate transformers diffusers pillow datasets
+pip install accelerate transformers pillow datasets
+pip install git+https://github.com/huggingface/diffusers
 ```
 
 For AMD GPUs, install a ROCm-enabled PyTorch build first using the official PyTorch selector.
@@ -59,8 +60,11 @@ Evaluation-oriented environment:
 
 ```bash
 pip install -e .
-pip install pillow tqdm datasets megfile numpy openai tenacity
+pip install pillow tqdm datasets megfile numpy openai tenacity accelerate transformers
+pip install git+https://github.com/huggingface/diffusers
 ```
+
+The paper-matched Qwen-Image-Edit-2509 baseline requires the latest Diffusers implementation of `QwenImageEditPlusPipeline`; a stale PyPI Diffusers build can silently put the baseline on the wrong inference stack.
 
 ## Environment variables
 

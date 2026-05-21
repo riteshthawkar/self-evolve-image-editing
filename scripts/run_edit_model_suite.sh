@@ -226,12 +226,21 @@ fi
 
 if [[ -z "$MODEL_NAME" ]]; then
   if [[ "$MODEL_TYPE" == "base" ]]; then
-    MODEL_NAME="qwen_edit_2509_base"
+    MODEL_NAME="qwen_edit_2509_official_diffusers"
   else
     checkpoint_stem="$(basename "${CHECKPOINT%.safetensors}")"
     MODEL_NAME="qwen_edit_2509_${MODEL_TYPE}_${checkpoint_stem}"
   fi
 fi
+
+has_eval_override() {
+  local wanted="$1"
+  local override
+  for override in "${EVAL_OVERRIDES[@]:-}"; do
+    [[ "$override" == "$wanted="* ]] && return 0
+  done
+  return 1
+}
 
 COMMON_EVAL_ARGS=(
   --set "model.model_type=$MODEL_TYPE"
@@ -239,6 +248,12 @@ COMMON_EVAL_ARGS=(
 )
 if [[ "$MODEL_TYPE" != "base" ]]; then
   COMMON_EVAL_ARGS+=(--set "model.checkpoint_path=$CHECKPOINT")
+  if ! has_eval_override "model.backend"; then
+    COMMON_EVAL_ARGS+=(--set "model.backend=diffsynth")
+  fi
+  if ! has_eval_override "generation.preserve_input_resolution"; then
+    COMMON_EVAL_ARGS+=(--set "generation.preserve_input_resolution=true")
+  fi
 fi
 for override in "${EVAL_OVERRIDES[@]:-}"; do
   [[ -n "$override" ]] || continue

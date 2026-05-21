@@ -1,4 +1,4 @@
-name: qwen_edit_2509_base
+name: qwen_edit_2509_official_diffusers
 benchmark: imgedit
 runtime:
   python_executable: python
@@ -6,11 +6,13 @@ runtime:
   dry_run: false
   log_dir: outputs/logs
 model:
+  backend: official_diffusers
   model_type: base
   base_model: Qwen/Qwen-Image-Edit-2509
   checkpoint_path: null
-  model_name: qwen_edit_2509_base
-  torch_dtype: auto
+  model_name: qwen_edit_2509_official_diffusers
+  torch_dtype: bfloat16
+  local_files_only: false
   model_id_with_origin_paths: Qwen/Qwen-Image-Edit-2509:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors
 dataset:
   edit_json: data/processed/benchmark/imgedit/basic_edit.json
@@ -18,15 +20,19 @@ dataset:
   prompts_json: third_party/imgedit/Benchmark/Basic/prompts.json
 generation:
   seed: 42
-  num_inference_steps: 28
+  num_inference_steps: 40
   true_cfg_scale: 4.0
   guidance_scale: 1.0
   negative_prompt: " "
+  num_images_per_prompt: 1
+  preserve_input_resolution: false
 output:
   edited_images_dir: outputs/benchmark_images/imgedit
   scores_dir: outputs/scores/imgedit
-  summary_path: outputs/scores/imgedit/qwen_edit_2509_base_summary.json
+  summary_path: outputs/scores/imgedit/qwen_edit_2509_official_diffusers_summary.json
+  allow_resume_mismatch: false
 scoring:
   num_processes: 4
+  expected_openai_model: gpt-4.1
 prompting:
   use_prompt_polish: false

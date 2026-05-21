@@ -14,7 +14,7 @@ each shard skips images that already exist unless --no-resume is passed through.
 
 Options:
   --model-type TYPE        base, lora, or full. Default: base
-  --model-name NAME        Output model name. Default: qwen_edit_2509_base
+  --model-name NAME        Output model name. Default: qwen_edit_2509_official_diffusers
   --checkpoint PATH        Required for lora/full
   --shard-size N           Number of records per shard. Default: 128
   --total N                Total records in GEdit split. Default: 1212
@@ -26,7 +26,7 @@ EOF
 }
 
 MODEL_TYPE="base"
-MODEL_NAME="qwen_edit_2509_base"
+MODEL_NAME="qwen_edit_2509_official_diffusers"
 CHECKPOINT=""
 SHARD_SIZE=128
 TOTAL=1212

@@ -36,7 +36,20 @@ def load_qwen_edit_pipeline(
     device: str = "auto",
     processor_model_id: str = "Qwen/Qwen-Image-Edit",
     torch_dtype: str | None = "auto",
+    backend: str = "diffsynth",
+    base_model: str | None = None,
+    local_files_only: bool = False,
 ):
+    if backend in {"diffusers", "official_diffusers", "qwen_edit_plus"}:
+        return load_qwen_edit_plus_pipeline(
+            base_model=base_model or _first_model_id(model_id_with_origin_paths),
+            checkpoint_path=checkpoint_path,
+            model_type=model_type,
+            device=device,
+            torch_dtype=torch_dtype,
+            local_files_only=local_files_only,
+        )
+
     torch, load_state_dict, ModelConfig, QwenImagePipeline = _load_diffsynth_modules()
     resolved_device = resolve_torch_device(device)
     resolved_dtype = resolve_torch_dtype(torch, torch_dtype, resolved_device)
@@ -54,6 +67,73 @@ def load_qwen_edit_pipeline(
     elif model_type == "full" and resolved_checkpoint is not None:
         state_dict = load_state_dict(str(resolved_checkpoint))
         pipe.dit.load_state_dict(state_dict)
+    pipe._qwen_edit_backend = "diffsynth"
+    return pipe
+
+
+def _first_model_id(model_id_with_origin_paths: str) -> str:
+    for part in model_id_with_origin_paths.split(","):
+        item = part.strip()
+        if item:
+            return item.split(":", 1)[0]
+    return "Qwen/Qwen-Image-Edit-2509"
+
+
+def _from_pretrained_with_dtype(pipeline_cls: Any, model_id: str, dtype: Any, local_files_only: bool) -> Any:
+    try:
+        return pipeline_cls.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
+        )
+    except TypeError as exc:
+        if "torch_dtype" not in str(exc):
+            raise
+    return pipeline_cls.from_pretrained(
+        model_id,
+        dtype=dtype,
+        local_files_only=local_files_only,
+    )
+
+
+def load_qwen_edit_plus_pipeline(
+    base_model: str = "Qwen/Qwen-Image-Edit-2509",
+    checkpoint_path: str | None = None,
+    model_type: str = "base",
+    device: str = "auto",
+    torch_dtype: str | None = "auto",
+    local_files_only: bool = False,
+):
+    import torch
+
+    try:
+        from diffusers import QwenImageEditPlusPipeline
+    except ImportError:
+        from diffusers import DiffusionPipeline
+
+        pipeline_cls = DiffusionPipeline
+    else:
+        pipeline_cls = QwenImageEditPlusPipeline
+
+    resolved_device = resolve_torch_device(device)
+    resolved_dtype = resolve_torch_dtype(torch, torch_dtype, resolved_device)
+    pipe = _from_pretrained_with_dtype(pipeline_cls, base_model, resolved_dtype, local_files_only)
+    if hasattr(pipe, "to"):
+        pipe.to(resolved_device)
+    if hasattr(pipe, "set_progress_bar_config"):
+        pipe.set_progress_bar_config(disable=None)
+
+    resolved_checkpoint = resolve_path(checkpoint_path) if checkpoint_path else None
+    if resolved_checkpoint is not None:
+        if model_type == "lora" and hasattr(pipe, "load_lora_weights"):
+            pipe.load_lora_weights(str(resolved_checkpoint))
+        else:
+            raise ValueError(
+                "The official Diffusers QwenImageEditPlusPipeline backend is only validated for "
+                "base-model evaluation or Diffusers-compatible LoRA weights. Use model.backend=diffsynth "
+                "for DiffSynth-trained full checkpoints."
+            )
+    pipe._qwen_edit_backend = "official_diffusers"
     return pipe
 
 
@@ -112,6 +192,8 @@ def build_generation_kwargs(generation: dict[str, Any]) -> dict[str, Any]:
         kwargs["guidance_scale"] = generation["guidance_scale"]
     if generation.get("true_cfg_scale") is not None:
         kwargs["true_cfg_scale"] = generation["true_cfg_scale"]
+    if generation.get("num_images_per_prompt") is not None:
+        kwargs["num_images_per_prompt"] = generation["num_images_per_prompt"]
     return kwargs
 
 
@@ -283,6 +365,21 @@ def render_edit(
 ) -> Image.Image:
     conditioning = normalize_edit_inputs(edit_images)
     kwargs = build_generation_kwargs(generation)
+    backend = getattr(pipe, "_qwen_edit_backend", "diffsynth")
+    if backend == "official_diffusers":
+        seed = kwargs.pop("seed", None)
+        if seed is not None and "generator" not in kwargs:
+            import torch
+
+            device = getattr(pipe, "_execution_device", getattr(pipe, "device", "cpu"))
+            try:
+                kwargs["generator"] = torch.Generator(device=device).manual_seed(int(seed))
+            except RuntimeError:
+                kwargs["generator"] = torch.Generator(device="cpu").manual_seed(int(seed))
+        kwargs["image"] = conditioning
+        kwargs["prompt"] = prompt
+        return pipe(**_filter_pipeline_kwargs(pipe, kwargs))
+
     kwargs["edit_image"] = conditioning
     return pipe(prompt, **_filter_pipeline_kwargs(pipe, kwargs))
 

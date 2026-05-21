@@ -1,4 +1,4 @@
-name: qwen_edit_2509_base
+name: qwen_edit_2509_official_diffusers
 benchmark: gedit
 runtime:
   python_executable: python
@@ -6,11 +6,13 @@ runtime:
   dry_run: false
   log_dir: outputs/logs
 model:
+  backend: official_diffusers
   model_type: base
   base_model: Qwen/Qwen-Image-Edit-2509
   checkpoint_path: null
-  model_name: qwen_edit_2509_base
-  torch_dtype: auto
+  model_name: qwen_edit_2509_official_diffusers
+  torch_dtype: bfloat16
+  local_files_only: false
   model_id_with_origin_paths: Qwen/Qwen-Image-Edit-2509:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors
 dataset:
   source: huggingface
@@ -21,16 +23,21 @@ dataset:
   task_type: all
 generation:
   seed: 42
-  num_inference_steps: 28
+  num_inference_steps: 40
   true_cfg_scale: 4.0
   guidance_scale: 1.0
   negative_prompt: " "
+  num_images_per_prompt: 1
+  preserve_input_resolution: false
 output:
   edited_images_dir: outputs/benchmark_images/gedit
   scores_dir: outputs/scores/gedit
-  summary_path: outputs/scores/gedit/qwen_edit_2509_base_summary.json
+  summary_path: outputs/scores/gedit/qwen_edit_2509_official_diffusers_summary.json
+  allow_resume_mismatch: false
 scoring:
+  # Upstream GEdit names this option "gpt4o", but VIEScore instantiates model_name="gpt-4.1".
   backbone: gpt4o
+  expected_openai_model: gpt-4.1
   save_dir: outputs/scores/gedit
   scorer_secret_env_path: secret.env
 prompting:
