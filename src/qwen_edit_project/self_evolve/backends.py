@@ -1286,7 +1286,7 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
             return []
         try:
             pipe = self._get_internal_pipe(editor)
-        except Exception:
+        except Exception as exc:
             return [
                 self._failure_result("cepr_internal_pipeline_error", candidate_index, len(edited_candidates))
                 for candidate_index in range(len(edited_candidates))
@@ -1321,7 +1321,7 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
                         "signals": {**edit_signals, **preservation_signals, "cepr_internal_supported": 1.0},
                     }
                 )
-            except Exception:
+            except Exception as exc:
                 rows.append(
                     {
                         "candidate_index": candidate_index,
@@ -1334,6 +1334,8 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
                         "signals": {
                             "cepr_internal_supported": 0.0,
                             "cepr_candidate_runtime_error": 1.0,
+                            "cepr_candidate_runtime_error_type": exc.__class__.__name__,
+                            "cepr_candidate_runtime_error_message": str(exc)[:500],
                         },
                     }
                 )

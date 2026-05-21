@@ -420,8 +420,19 @@ def extract_qwen_vae_latents(
     if dtype is None:
         dtype = torch.float32
     pixel_values = _image_to_vae_tensor(pipe, image, size=size, device=device, dtype=dtype)
+
+    if hasattr(pipe, "_encode_vae_image"):
+        vae_input = pixel_values.unsqueeze(2) if pixel_values.ndim == 4 else pixel_values
+        with torch.no_grad():
+            return pipe._encode_vae_image(vae_input, generator=None).float()
+
     with torch.no_grad():
-        encoded = vae.encode(pixel_values)
+        try:
+            encoded = vae.encode(pixel_values)
+        except Exception:
+            if pixel_values.ndim != 4:
+                raise
+            encoded = vae.encode(pixel_values.unsqueeze(2))
 
     latent_dist = getattr(encoded, "latent_dist", None)
     if latent_dist is not None:
