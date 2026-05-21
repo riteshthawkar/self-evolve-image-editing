@@ -379,6 +379,77 @@ def extract_qwen_text_features(
     }
 
 
+def _image_to_vae_tensor(
+    pipe: Any,
+    image: Image.Image,
+    size: int,
+    device: Any,
+    dtype: Any,
+):
+    import numpy as np
+    import torch
+
+    image = image.convert("RGB").resize((size, size), Image.Resampling.BICUBIC)
+    processor = getattr(pipe, "image_processor", None)
+    if processor is not None and hasattr(processor, "preprocess"):
+        try:
+            return processor.preprocess(image).to(device=device, dtype=dtype)
+        except Exception:
+            pass
+
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
+    tensor = tensor * 2.0 - 1.0
+    return tensor.to(device=device, dtype=dtype)
+
+
+def extract_qwen_vae_latents(
+    pipe: Any,
+    image: Image.Image,
+    size: int = 512,
+):
+    """Encode an image with the editor's own VAE for internal preservation rewards."""
+    import torch
+
+    vae = getattr(pipe, "vae", None)
+    if vae is None or not hasattr(vae, "encode"):
+        raise ValueError("Qwen VAE latents require a pipeline with a VAE encoder.")
+
+    device = getattr(pipe, "device", getattr(pipe, "_execution_device", "cpu"))
+    dtype = getattr(pipe, "torch_dtype", getattr(vae, "dtype", torch.float32))
+    if dtype is None:
+        dtype = torch.float32
+    pixel_values = _image_to_vae_tensor(pipe, image, size=size, device=device, dtype=dtype)
+    with torch.no_grad():
+        encoded = vae.encode(pixel_values)
+
+    latent_dist = getattr(encoded, "latent_dist", None)
+    if latent_dist is not None:
+        if hasattr(latent_dist, "mean"):
+            mean = latent_dist.mean
+            latents = mean() if callable(mean) else mean
+        else:
+            latents = latent_dist.mode()
+    elif hasattr(encoded, "latents"):
+        latents = encoded.latents
+    elif isinstance(encoded, (tuple, list)):
+        latents = encoded[0]
+        nested_dist = getattr(latents, "latent_dist", None)
+        if nested_dist is not None:
+            if hasattr(nested_dist, "mean"):
+                nested_mean = nested_dist.mean
+                latents = nested_mean() if callable(nested_mean) else nested_mean
+            else:
+                latents = nested_dist.mode()
+    else:
+        latents = encoded
+
+    scaling_factor = getattr(getattr(vae, "config", None), "scaling_factor", None)
+    if scaling_factor is not None:
+        latents = latents * scaling_factor
+    return latents.float()
+
+
 def render_edit(
     pipe: Any,
     prompt: str,

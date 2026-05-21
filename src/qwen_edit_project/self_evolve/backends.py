@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 import statistics
 from typing import Any
@@ -22,6 +23,7 @@ from qwen_edit_project.utils.prompting import polish_prompt
 from qwen_edit_project.utils.qwen_pipeline import (
     extract_qwen_edit_understanding_features,
     extract_qwen_text_features,
+    extract_qwen_vae_latents,
     load_qwen_edit_pipeline,
     render_edit,
 )
@@ -43,6 +45,14 @@ INTERNAL_ONLY_METRICS = {"internal_prompt_gain", "semantic"}
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
     return max(minimum, min(maximum, value))
+
+
+def _sigmoid(value: float) -> float:
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
 
 
 def _mean_changed_fraction_score(value: float, expected_range: tuple[float, float]) -> float:
@@ -1007,6 +1017,375 @@ class HardGatedRelativeEvaluator(MultiSignalSolver):
         return outputs
 
 
+class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
+    """Internal-only CEPR evaluator for the main self-evolving method.
+
+    The reward is intentionally constrained instead of additive:
+
+    R(y | x, c) = sqrt(E(y, x, c) * P(y, x)) when edit, preservation, and
+    validity gates pass; otherwise R=0.
+
+    E is an internal contrastive prompt-gain score against counterfactual
+    instructions. P is internal source preservation from Qwen semantic features
+    and Qwen VAE latent locality. Q is a hard validity gate over edit-region
+    plausibility and excessive latent drift. No external VLM, detector, CLIP, or
+    OCR model is used.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        super().__init__(config)
+        self.edit_threshold = float(config.get("edit_threshold", 0.53))
+        self.preservation_threshold = float(config.get("preservation_threshold", 0.60))
+        self.validity_threshold = float(config.get("validity_threshold", 0.35))
+        self.reward_threshold = float(config.get("reward_threshold", config.get("quality_threshold", 0.52)))
+        self.top_m = int(config.get("top_m", 1))
+        self.require_internal_components = bool(config.get("require_internal_components", True))
+        self.edit_temperature = float(config.get("edit_temperature", 0.04))
+        self.true_gain_temperature = float(config.get("true_gain_temperature", 0.04))
+        self.min_true_gain = float(config.get("min_true_gain", 0.0))
+        self.semantic_preservation_temperature = float(config.get("semantic_preservation_temperature", 0.08))
+        self.latent_resolution = int(config.get("latent_resolution", 512))
+        self.latent_mask_std_scale = float(config.get("latent_mask_std_scale", 0.75))
+        self.latent_mask_min_delta = float(config.get("latent_mask_min_delta", 0.03))
+        self.latent_preservation_temperature = float(config.get("latent_preservation_temperature", 0.12))
+        self.max_total_latent_delta = float(config.get("max_total_latent_delta", 0.45))
+        self.latent_drift_temperature = float(config.get("latent_drift_temperature", 0.15))
+
+    @staticmethod
+    def _cosine_similarity(value_a: Any, value_b: Any) -> float:
+        import torch.nn.functional as F
+
+        return float(F.cosine_similarity(value_a.unsqueeze(0), value_b.unsqueeze(0)).item())
+
+    def _get_internal_pipe(self, editor: Any | None) -> Any:
+        if not isinstance(editor, QwenEditEditor):
+            raise ValueError("internal_cepr requires QwenEditEditor so rewards are computed from the editor itself.")
+        return editor._ensure_pipeline()
+
+    def _cached_text_feature(self, pipe: Any, prompt: str, cache: dict[tuple[str, str], Any]):
+        key = ("text", prompt)
+        if key not in cache:
+            try:
+                cache[key] = extract_qwen_text_features(pipe, prompt)["pooled_embedding"][0].float()
+            except Exception:
+                # Some public Qwen wrappers expose only the multimodal encoder path.
+                # A neutral image keeps the reward internal while still yielding a prompt-conditioned anchor.
+                neutral_image = Image.new("RGB", (self.latent_resolution, self.latent_resolution), (127, 127, 127))
+                cache[key] = extract_qwen_edit_understanding_features(pipe, prompt, [neutral_image])[
+                    "pooled_embedding"
+                ][0].float()
+        return cache[key]
+
+    def _cached_understanding_feature(
+        self,
+        pipe: Any,
+        prompt: str,
+        image_label: str,
+        image: Image.Image,
+        cache: dict[tuple[str, str], Any],
+    ):
+        key = ("understanding", f"{image_label}|{prompt}")
+        if key not in cache:
+            cache[key] = extract_qwen_edit_understanding_features(pipe, prompt, [image])["pooled_embedding"][0].float()
+        return cache[key]
+
+    def _cached_vae_latents(
+        self,
+        pipe: Any,
+        image_label: str,
+        image: Image.Image,
+        cache: dict[tuple[str, str], Any],
+    ):
+        key = ("vae_latents", image_label)
+        if key not in cache:
+            cache[key] = extract_qwen_vae_latents(pipe, image, size=self.latent_resolution)
+        return cache[key]
+
+    def _prompt_gain_cached(
+        self,
+        pipe: Any,
+        instruction: str,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> float:
+        prompt = polish_prompt(instruction, use_prompt_polish=False, image_context=original)
+        text_feature = self._cached_text_feature(pipe, prompt, cache)
+        original_feature = self._cached_understanding_feature(pipe, prompt, "original", original, cache)
+        edited_feature = self._cached_understanding_feature(pipe, prompt, f"candidate:{candidate_index}", edited, cache)
+        original_similarity = self._cosine_similarity(original_feature, text_feature)
+        edited_similarity = self._cosine_similarity(edited_feature, text_feature)
+        return edited_similarity - original_similarity
+
+    def _edit_specificity(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, dict[str, float]]:
+        true_gain = self._prompt_gain_cached(pipe, proposal.instruction, original, edited, candidate_index, cache)
+        distractor_gains = [
+            self._prompt_gain_cached(pipe, definition.instruction, original, edited, candidate_index, cache)
+            for definition in self._distractor_definitions(proposal)
+        ]
+        max_distractor_gain = max(distractor_gains) if distractor_gains else 0.0
+        contrastive_margin = true_gain - max_distractor_gain
+        contrastive_score = _sigmoid(contrastive_margin / max(self.edit_temperature, 1e-6))
+        absolute_score = _sigmoid((true_gain - self.min_true_gain) / max(self.true_gain_temperature, 1e-6))
+        edit_specificity = math.sqrt(max(contrastive_score * absolute_score, 0.0))
+        return edit_specificity, {
+            "cepr_true_prompt_gain": true_gain,
+            "cepr_max_distractor_gain": max_distractor_gain,
+            "cepr_contrastive_margin": contrastive_margin,
+            "cepr_contrastive_score": contrastive_score,
+            "cepr_absolute_edit_score": absolute_score,
+            "cepr_distractor_count": float(len(distractor_gains)),
+        }
+
+    def _semantic_preservation(
+        self,
+        pipe: Any,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, dict[str, float]]:
+        original_feature = self._cached_understanding_feature(pipe, " ", "original", original, cache)
+        edited_feature = self._cached_understanding_feature(pipe, " ", f"candidate:{candidate_index}", edited, cache)
+        cosine = self._cosine_similarity(original_feature, edited_feature)
+        cosine_01 = 0.5 * (1.0 + cosine)
+        semantic_preservation = math.exp(-(1.0 - cosine_01) / max(self.semantic_preservation_temperature, 1e-6))
+        return _clamp(semantic_preservation), {
+            "cepr_semantic_preservation_cosine": cosine,
+            "cepr_semantic_preservation_score": _clamp(semantic_preservation),
+        }
+
+    def _latent_locality(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, float, dict[str, float]]:
+        import torch
+
+        original_latents = self._cached_vae_latents(pipe, "original", original, cache)
+        edited_latents = self._cached_vae_latents(pipe, f"candidate:{candidate_index}", edited, cache)
+        delta = (original_latents - edited_latents).abs().mean(dim=1).squeeze(0)
+        normalizer = 0.5 * (
+            original_latents.abs().mean(dim=1).squeeze(0) + edited_latents.abs().mean(dim=1).squeeze(0)
+        )
+        relative_delta = delta / normalizer.clamp_min(1e-4)
+        mean_delta = float(relative_delta.mean().item())
+        std_delta = float(relative_delta.std(unbiased=False).item())
+        threshold = max(self.latent_mask_min_delta, mean_delta + self.latent_mask_std_scale * std_delta)
+        mask = relative_delta > threshold
+        changed_fraction_value = float(mask.float().mean().item())
+        if mask.any():
+            inside_delta = float(relative_delta[mask].mean().item())
+        else:
+            inside_delta = 0.0
+        if (~mask).any():
+            outside_delta = float(relative_delta[~mask].mean().item())
+        else:
+            outside_delta = mean_delta
+
+        outside_preservation = math.exp(-outside_delta / max(self.latent_preservation_temperature, 1e-6))
+        region_score = _mean_changed_fraction_score(changed_fraction_value, proposal.definition.expected_changed_fraction)
+        excess_drift = max(0.0, mean_delta - self.max_total_latent_delta)
+        drift_score = math.exp(-excess_drift / max(self.latent_drift_temperature, 1e-6))
+        validity = math.sqrt(max(region_score * drift_score, 0.0))
+        return _clamp(outside_preservation), _clamp(validity), {
+            "cepr_latent_outside_preservation": _clamp(outside_preservation),
+            "cepr_latent_region_score": region_score,
+            "cepr_latent_validity_score": _clamp(validity),
+            "cepr_latent_changed_fraction": changed_fraction_value,
+            "cepr_latent_inside_delta": inside_delta,
+            "cepr_latent_outside_delta": outside_delta,
+            "cepr_latent_total_delta": mean_delta,
+            "cepr_latent_delta_std": std_delta,
+            "cepr_latent_mask_threshold": threshold,
+            "cepr_latent_drift_score": _clamp(drift_score),
+        }
+
+    def _preservation_and_validity(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, float, dict[str, float]]:
+        semantic_preservation, semantic_signals = self._semantic_preservation(
+            pipe, original, edited, candidate_index, cache
+        )
+        latent_preservation, validity, latent_signals = self._latent_locality(
+            pipe, proposal, original, edited, candidate_index, cache
+        )
+        preservation = math.sqrt(max(semantic_preservation * latent_preservation, 0.0))
+        signals = {
+            **semantic_signals,
+            **latent_signals,
+            "cepr_preservation_score": _clamp(preservation),
+            "cepr_validity_score": _clamp(validity),
+        }
+        return _clamp(preservation), _clamp(validity), signals
+
+    def _failure_result(self, error_name: str, candidate_index: int, group_size: int) -> SolverResult:
+        signals = {
+            "candidate_index": float(candidate_index),
+            "group_size": float(group_size),
+            "feasible": 0.0,
+            "accepted_by_ranker": 0.0,
+            "feasible_rank": 0.0,
+            "cepr_internal_supported": 0.0,
+            error_name: 1.0,
+            "cepr_edit_threshold": self.edit_threshold,
+            "cepr_preservation_threshold": self.preservation_threshold,
+            "cepr_validity_threshold": self.validity_threshold,
+            "cepr_reward_threshold": self.reward_threshold,
+        }
+        return SolverResult(
+            global_score=0.0,
+            local_score=0.0,
+            total_score=0.0,
+            accepted=False,
+            component_scores={
+                "cepr_edit_specificity": 0.0,
+                "cepr_preservation": 0.0,
+                "cepr_validity": 0.0,
+                "cepr_reward": 0.0,
+            },
+            signals=signals,
+        )
+
+    def score(
+        self,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        editor: Any | None = None,
+    ) -> SolverResult:
+        return self.score_group(proposal, original, [edited], editor=editor)[0]
+
+    def score_group(
+        self,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited_candidates: list[Image.Image],
+        editor: Any | None = None,
+    ) -> list[SolverResult]:
+        if not edited_candidates:
+            return []
+        try:
+            pipe = self._get_internal_pipe(editor)
+        except Exception:
+            return [
+                self._failure_result("cepr_internal_pipeline_error", candidate_index, len(edited_candidates))
+                for candidate_index in range(len(edited_candidates))
+            ]
+
+        cache: dict[tuple[str, str], Any] = {}
+        rows: list[dict[str, Any]] = []
+        for candidate_index, edited in enumerate(edited_candidates):
+            try:
+                edit_specificity, edit_signals = self._edit_specificity(
+                    pipe, proposal, original, edited, candidate_index, cache
+                )
+                preservation, validity, preservation_signals = self._preservation_and_validity(
+                    pipe, proposal, original, edited, candidate_index, cache
+                )
+                reward = math.sqrt(max(edit_specificity * preservation, 0.0))
+                feasible = (
+                    edit_specificity >= self.edit_threshold
+                    and preservation >= self.preservation_threshold
+                    and validity >= self.validity_threshold
+                    and reward >= self.reward_threshold
+                )
+                rows.append(
+                    {
+                        "candidate_index": candidate_index,
+                        "edit_specificity": edit_specificity,
+                        "preservation": preservation,
+                        "validity": validity,
+                        "reward": reward if feasible else 0.0,
+                        "raw_reward": reward,
+                        "feasible": feasible,
+                        "signals": {**edit_signals, **preservation_signals, "cepr_internal_supported": 1.0},
+                    }
+                )
+            except Exception:
+                rows.append(
+                    {
+                        "candidate_index": candidate_index,
+                        "edit_specificity": 0.0,
+                        "preservation": 0.0,
+                        "validity": 0.0,
+                        "reward": 0.0,
+                        "raw_reward": 0.0,
+                        "feasible": False,
+                        "signals": {
+                            "cepr_internal_supported": 0.0,
+                            "cepr_candidate_runtime_error": 1.0,
+                        },
+                    }
+                )
+
+        ranked_rows = sorted(
+            [row for row in rows if row["feasible"]],
+            key=lambda row: row["reward"],
+            reverse=True,
+        )
+        accepted_candidate_indices = {row["candidate_index"] for row in ranked_rows[: self.top_m]}
+        rank_by_candidate = {row["candidate_index"]: rank + 1 for rank, row in enumerate(ranked_rows)}
+
+        outputs: list[SolverResult] = []
+        for row in rows:
+            candidate_index = row["candidate_index"]
+            accepted = candidate_index in accepted_candidate_indices
+            rank = rank_by_candidate.get(candidate_index, 0)
+            reward = row["reward"]
+            signals = dict(row["signals"])
+            signals.update(
+                {
+                    "candidate_index": float(candidate_index),
+                    "group_size": float(len(rows)),
+                    "feasible": 1.0 if row["feasible"] else 0.0,
+                    "accepted_by_ranker": 1.0 if accepted else 0.0,
+                    "feasible_rank": float(rank),
+                    "cepr_edit_threshold": self.edit_threshold,
+                    "cepr_preservation_threshold": self.preservation_threshold,
+                    "cepr_validity_threshold": self.validity_threshold,
+                    "cepr_reward_threshold": self.reward_threshold,
+                }
+            )
+            component_scores = {
+                "cepr_edit_specificity": row["edit_specificity"],
+                "cepr_preservation": row["preservation"],
+                "cepr_validity": row["validity"],
+                "cepr_raw_reward": row["raw_reward"],
+                "cepr_reward": reward,
+            }
+            outputs.append(
+                SolverResult(
+                    global_score=row["edit_specificity"],
+                    local_score=row["preservation"],
+                    total_score=reward,
+                    accepted=accepted,
+                    component_scores=component_scores,
+                    signals=signals,
+                )
+            )
+        return outputs
+
+
 def build_proposer(config: dict[str, Any]):
     backend = config.get("backend", "scripted")
     if backend == "scripted":
@@ -1051,4 +1430,10 @@ def build_solver(config: dict[str, Any]):
         solver_config.setdefault("cycle_weight", 0.0)
         solver_config.setdefault("internal_weight", 0.0)
         return HardGatedRelativeEvaluator(solver_config)
+    if backend in {"internal_cepr", "contrastive_edit_preservation"}:
+        solver_config = dict(config)
+        solver_config.setdefault("counterfactual_backend", "internal")
+        solver_config.setdefault("counterfactual_distractors", 4)
+        solver_config.setdefault("top_m", 1)
+        return InternalContrastiveEditPreservationEvaluator(solver_config)
     raise ValueError(f"Unsupported solver backend: {backend}")

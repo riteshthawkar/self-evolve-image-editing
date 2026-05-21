@@ -10,7 +10,7 @@ usage() {
 Usage: bash scripts/run_self_evolve_matrix.sh [options]
 
 Options:
-  --variant NAME                base, naive-self-train, evolmm-style, spatial, cycle, internal, hybrid, hybrid-scalar, delta-ranker, delta-ranker-proxy, delta-grounded, delta-results, pillow-demo, pillow-hybrid, pillow-delta-ranker, or all. Default: all
+  --variant NAME                base, internal-cepr, naive-self-train, evolmm-style, spatial, cycle, internal, hybrid, hybrid-scalar, delta-ranker, delta-ranker-proxy, delta-grounded, delta-results, pillow-demo, pillow-hybrid, pillow-delta-ranker, or all. Default: all
   --limit N                     Limit number of unlabeled records.
   --images-dir PATH             Override dataset.images_dir.
   --metadata-jsonl PATH         Optional sidecar metadata for directory datasets.
@@ -122,6 +122,7 @@ fi
 variant_script() {
   case "$1" in
     base) echo "scripts/self_evolve_2509.sh" ;;
+    internal-cepr) echo "scripts/self_evolve_2509_internal_cepr.sh" ;;
     naive-self-train) echo "scripts/self_evolve_2509.sh" ;;
     evolmm-style) echo "scripts/self_evolve_2509_evolmm_style.sh" ;;
     spatial) echo "scripts/self_evolve_2509_spatial.sh" ;;
@@ -141,7 +142,7 @@ variant_script() {
 }
 
 if [[ "$VARIANT" == "all" ]]; then
-  variants=(base naive-self-train evolmm-style spatial cycle internal hybrid delta-ranker delta-grounded delta-results)
+  variants=(base internal-cepr naive-self-train evolmm-style spatial cycle internal hybrid delta-ranker delta-grounded delta-results)
 else
   variants=("$VARIANT")
 fi
