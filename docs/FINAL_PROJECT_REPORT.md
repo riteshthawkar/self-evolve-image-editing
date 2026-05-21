@@ -329,6 +329,37 @@ Main script:
 scripts/self_evolve_2509_internal_cepr.sh
 ```
 
+### 5.5 Reward Component Analysis
+
+After every CEPR pilot, analyze whether each internal component is helping:
+
+```bash
+bash scripts/analyze_self_evolve_rewards.sh \
+  --proposals outputs/self_evolve/<run>/internal-cepr/round_01/proposals.jsonl \
+  --edit-threshold 0.45 \
+  --preservation-threshold 0.20 \
+  --validity-threshold 0.50 \
+  --reward-threshold 0.30
+```
+
+This writes:
+
+```text
+reward_analysis/summary.json
+reward_analysis/components.csv
+reward_analysis/threshold_sweep.csv
+reward_analysis/top_thresholds.json
+```
+
+Use this analysis to answer:
+
+- whether `cepr_edit_specificity` is separating useful edits from weak/no-op edits
+- whether `cepr_semantic_preservation_score` stays high for source-consistent edits
+- whether `cepr_latent_outside_preservation` is too harsh for global edits
+- whether `cepr_validity` catches destructive latent drift
+- which threshold is the main bottleneck
+- how many candidates would be accepted under calibrated thresholds
+
 ## 6. Self-Evolving Training Pipeline
 
 Main command without training launch:
