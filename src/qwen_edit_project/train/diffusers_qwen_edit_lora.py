@@ -689,12 +689,13 @@ def main() -> None:
             with accelerator.accumulate(transformer):
                 if len(batch) != 1:
                     raise ValueError("Diffusers edit training currently expects exactly one example per batch.")
+                example = batch[0]
                 prepared = encode_edit_example(
                     args=args,
                     conditioning_pipe=conditioning_pipe,
                     vae=vae,
                     text_encoder=text_encoder,
-                    example=batch[0],
+                    example=example,
                     accelerator=accelerator,
                     weight_dtype=weight_dtype,
                     latents_mean=latents_mean,
