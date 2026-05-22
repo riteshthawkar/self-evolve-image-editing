@@ -24,6 +24,7 @@ The code lives under [src/qwen_edit_project/self_evolve](/Users/ritesh.thawkar/R
 
 - `scripted`
 - `internal_qwen` placeholder
+- `trainable_qwen_image_edit`
 - `trainable_qwen_vl`
 
 ### Editor
@@ -87,9 +88,12 @@ This path is the intended bridge from heuristic self-training to a learned evalu
 
 ## Trainable Proposer Path
 
-The trainable proposer path uses a separate Qwen-VL LoRA only during data generation. It is not
-used for final editor evaluation. At the end of each round, proposal outcomes are aggregated into
-`proposer_training.jsonl`; proposals receive the highest reward when they create useful
+The main trainable proposer path uses the Qwen-Image-Edit checkpoint's own VLM/text-encoder
+component (`Qwen/Qwen-Image-Edit-2509`, `text_encoder` subfolder) during data generation. The
+diffusion editor cannot emit text instructions directly, so the proposer is attached to the edit
+model's autoregressive VLM component and trained with a separate proposer LoRA. That proposer LoRA is
+not used for final editor evaluation. At the end of each round, proposal outcomes are aggregated
+into `proposer_training.jsonl`; proposals receive the highest reward when they create useful
 medium-difficulty editor-training samples:
 
 - zero accepted candidates is treated as too hard
@@ -245,5 +249,5 @@ checkpoint into the next round if one is found. For Diffusers-native editor LoRA
 `--resume_from_checkpoint latest` when `training.resume_from_latest: true`.
 
 For trainable-proposer runs, `proposer.training.resume_from_latest: true` does the same for the
-Qwen-VL proposer LoRA trainer. The final benchmark/evaluation model remains the editor LoRA, not the
-proposer LoRA.
+Qwen-Image-Edit VLM proposer LoRA trainer. The final benchmark/evaluation model remains the editor
+LoRA, not the proposer LoRA.

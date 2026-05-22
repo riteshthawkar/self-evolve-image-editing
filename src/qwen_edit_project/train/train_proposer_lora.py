@@ -130,7 +130,13 @@ class ProposerCollator:
         return inputs
 
 
-def _model_class():
+def _model_class(model_class: str):
+    if model_class == "qwen2_5_vl":
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        return Qwen2_5_VLForConditionalGeneration
+    if model_class != "auto":
+        raise ValueError(f"Unsupported proposer model_class: {model_class}")
     try:
         from transformers import AutoModelForImageTextToText
 
@@ -147,8 +153,11 @@ def _model_class():
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a Qwen-VL proposer LoRA from self-evolve proposal rewards.")
+    parser = argparse.ArgumentParser(description="Train a Qwen-Image-Edit VLM proposer LoRA from self-evolve rewards.")
     parser.add_argument("--model_name_or_path", required=True)
+    parser.add_argument("--model_subfolder", default=None)
+    parser.add_argument("--processor_subfolder", default=None)
+    parser.add_argument("--model_class", default="auto", choices=["auto", "qwen2_5_vl"])
     parser.add_argument("--train_jsonl", required=True)
     parser.add_argument("--dataset_base_path", default=".")
     parser.add_argument("--output_dir", required=True)
@@ -195,18 +204,22 @@ def main() -> None:
     )
     base_dir = Path(args.dataset_base_path).resolve()
     records = _load_records(Path(args.train_jsonl).resolve(), args.min_reward)
-    processor = AutoProcessor.from_pretrained(
-        args.model_name_or_path,
-        trust_remote_code=True,
-        local_files_only=args.local_files_only,
-    )
+    processor_kwargs = {
+        "trust_remote_code": True,
+        "local_files_only": args.local_files_only,
+    }
+    if args.processor_subfolder:
+        processor_kwargs["subfolder"] = args.processor_subfolder
+    processor = AutoProcessor.from_pretrained(args.model_name_or_path, **processor_kwargs)
     dtype = resolve_torch_dtype(torch, args.torch_dtype, accelerator.device)
-    model = _model_class().from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        local_files_only=args.local_files_only,
-    )
+    model_kwargs = {
+        "torch_dtype": dtype,
+        "trust_remote_code": True,
+        "local_files_only": args.local_files_only,
+    }
+    if args.model_subfolder:
+        model_kwargs["subfolder"] = args.model_subfolder
+    model = _model_class(args.model_class).from_pretrained(args.model_name_or_path, **model_kwargs)
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     if args.checkpoint_path:
@@ -326,6 +339,9 @@ def main() -> None:
         processor.save_pretrained(output_dir)
         metadata = {
             "model_name_or_path": args.model_name_or_path,
+            "model_subfolder": args.model_subfolder,
+            "processor_subfolder": args.processor_subfolder,
+            "model_class": args.model_class,
             "train_jsonl": str(Path(args.train_jsonl).resolve()),
             "records": len(records),
             "global_step": global_step,

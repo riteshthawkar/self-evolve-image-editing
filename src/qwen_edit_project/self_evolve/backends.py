@@ -223,16 +223,20 @@ class InternalQwenProposer:
 
 
 class TrainableQwenVLProposer:
-    """Round-updatable Qwen-VL proposer with a scripted bootstrap fallback.
+    """Round-updatable Qwen-Image-Edit VLM proposer with a scripted bootstrap fallback.
 
-    The proposer emits a structured edit JSON object. The loop trains this proposer through a
-    separate LoRA checkpoint at round boundaries; the final editor evaluation never uses this
-    proposer checkpoint.
+    The proposer emits a structured edit JSON object using the autoregressive VLM/text-encoder
+    component from the edit checkpoint. The diffusion editor itself cannot emit text; using the
+    edit model's VLM component keeps the proposer tied to the same model family while training a
+    separate proposer LoRA that is never used for final editor evaluation.
     """
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        self.model_name_or_path = str(config.get("model_name_or_path", "Qwen/Qwen2.5-VL-7B-Instruct"))
+        self.model_name_or_path = str(config.get("model_name_or_path", "Qwen/Qwen-Image-Edit-2509"))
+        self.model_subfolder = config.get("model_subfolder", "text_encoder")
+        self.processor_subfolder = config.get("processor_subfolder", "processor")
+        self.model_class = str(config.get("model_class", "qwen2_5_vl"))
         self.checkpoint_path = config.get("checkpoint_path")
         self.device = config.get("device", "auto")
         self.torch_dtype = config.get("torch_dtype", "auto")
@@ -257,8 +261,10 @@ class TrainableQwenVLProposer:
 
     def model_state(self) -> dict[str, Any]:
         return {
-            "backend": "trainable_qwen_vl",
+            "backend": self.config.get("backend", "trainable_qwen_image_edit"),
             "model_name_or_path": self.model_name_or_path,
+            "model_subfolder": self.model_subfolder,
+            "processor_subfolder": self.processor_subfolder,
             "checkpoint_path": self.checkpoint_path,
         }
 
@@ -277,27 +283,34 @@ class TrainableQwenVLProposer:
 
         from qwen_edit_project.utils.device import resolve_torch_dtype
 
-        try:
-            from transformers import AutoModelForImageTextToText
-        except ImportError:
+        if self.model_class == "qwen2_5_vl":
+            from transformers import Qwen2_5_VLForConditionalGeneration as ModelClass
+        else:
             try:
-                from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
+                from transformers import AutoModelForImageTextToText as ModelClass
             except ImportError:
-                from transformers import AutoModelForCausalLM as AutoModelForImageTextToText
+                try:
+                    from transformers import AutoModelForVision2Seq as ModelClass
+                except ImportError:
+                    from transformers import AutoModelForCausalLM as ModelClass
         from transformers import AutoProcessor
 
         dtype = resolve_torch_dtype(torch, self.torch_dtype, self._resolve_device(self.device))
-        self.processor = AutoProcessor.from_pretrained(
-            self.model_name_or_path,
-            trust_remote_code=True,
-            local_files_only=self.local_files_only,
-        )
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            self.model_name_or_path,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            local_files_only=self.local_files_only,
-        )
+        processor_kwargs = {
+            "trust_remote_code": True,
+            "local_files_only": self.local_files_only,
+        }
+        if self.processor_subfolder:
+            processor_kwargs["subfolder"] = self.processor_subfolder
+        model_kwargs = {
+            "torch_dtype": dtype,
+            "trust_remote_code": True,
+            "local_files_only": self.local_files_only,
+        }
+        if self.model_subfolder:
+            model_kwargs["subfolder"] = self.model_subfolder
+        self.processor = AutoProcessor.from_pretrained(self.model_name_or_path, **processor_kwargs)
+        self.model = ModelClass.from_pretrained(self.model_name_or_path, **model_kwargs)
         if self.checkpoint_path:
             from peft import PeftModel
 
@@ -1934,7 +1947,7 @@ def build_proposer(config: dict[str, Any]):
         return ScriptedProposer(config)
     if backend == "internal_qwen":
         return InternalQwenProposer()
-    if backend in {"trainable_qwen_vl", "qwen_vl_lora"}:
+    if backend in {"trainable_qwen_image_edit", "qwen_image_edit_lora", "trainable_qwen_vl", "qwen_vl_lora"}:
         return TrainableQwenVLProposer(config)
     raise ValueError(f"Unsupported proposer backend: {backend}")
 

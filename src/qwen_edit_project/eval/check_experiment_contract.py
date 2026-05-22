@@ -65,6 +65,21 @@ def check_eval_config(path: str | Path, errors: list[str]) -> None:
 def check_self_evolve_config(path: str | Path, errors: list[str]) -> None:
     config = load_yaml_config(path)
     prefix = _format_path(path)
+    proposer = config.get("proposer", {})
+    if proposer.get("backend") in {"trainable_qwen_image_edit", "qwen_image_edit_lora"}:
+        require_equal(
+            proposer.get("model_name_or_path"),
+            EXPECTED_BASE_MODEL,
+            f"{prefix}.proposer.model_name_or_path",
+            errors,
+        )
+        require_equal(proposer.get("model_subfolder"), "text_encoder", f"{prefix}.proposer.model_subfolder", errors)
+        require_equal(
+            proposer.get("processor_subfolder"),
+            "processor",
+            f"{prefix}.proposer.processor_subfolder",
+            errors,
+        )
     editor = config.get("editor", {})
     require_equal(editor.get("backend"), "qwen_edit", f"{prefix}.editor.backend", errors)
     check_generation(f"{prefix}.editor", editor.get("generation", {}), errors)
