@@ -116,6 +116,17 @@ Rounds can be micro-batches rather than full-dataset passes. With
 `curriculum.record_schedule=sequential_shards`, round 1 uses the first
 `curriculum.max_records_per_round` images, round 2 uses the next shard, and so on, wrapping only
 after all available records are consumed. This keeps updates frequent without per-image overfitting.
+The trainable-proposer CEPR config defaults to 8 source images per round and
+`curriculum.num_rounds=auto`, so a run with `--limit 1024` performs 128 update rounds over distinct
+8-image shards.
+
+The 8-image micro-round is a compute-control choice, not a benchmark-tuned threshold. With the
+default 4 candidates per proposal it gives 32 CEPR-scored candidate edits before each update. This
+is the smallest practical batch we use because it gives the editor both positive and borderline
+weighted targets, gives the proposer multiple reward observations before a LoRA step, and still
+updates far more frequently than a 64- or 256-image round. Single-image updates provide only 4
+candidate edits, so a reward outlier can dominate the update and the proposer reward becomes too
+noisy.
 
 Use:
 

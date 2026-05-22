@@ -122,6 +122,14 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
 
+def _resolve_num_rounds(value: Any, record_count: int, max_records_per_round: int) -> int:
+    if isinstance(value, str) and value.lower() in {"auto", "all", "cover_dataset"}:
+        if record_count <= 0:
+            return 0
+        return max(1, math.ceil(record_count / max(1, max_records_per_round)))
+    return int(value)
+
+
 class SelfEvolveRunner:
     def __init__(self, config: dict[str, Any], dry_run: bool = False, limit: int | None = None):
         self.config = config
@@ -885,7 +893,7 @@ class SelfEvolveRunner:
         samples_per_proposal = int(candidate_generation.get("samples_per_proposal", 1))
         candidate_seed_stride = int(candidate_generation.get("seed_stride", 7919))
         max_records_per_round = int(curriculum.get("max_records_per_round", len(self.records)))
-        num_rounds = int(curriculum.get("num_rounds", 3))
+        num_rounds = _resolve_num_rounds(curriculum.get("num_rounds", 3), len(self.records), max_records_per_round)
         output_cfg = self.config["output"]
         resume_cfg = output_cfg.get("resume", {})
         resume_enabled = bool(resume_cfg.get("enabled", True))

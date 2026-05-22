@@ -109,7 +109,7 @@ evaluator:
   retry_cpu_on_oom: true
   require_internal_components: true
 curriculum:
-  num_rounds: 3
+  num_rounds: auto
   record_schedule: sequential_shards
   proposals_per_image: 1
   initial_level: 2
@@ -117,7 +117,7 @@ curriculum:
   max_level: 3
   promote_at: 0.65
   demote_at: 0.25
-  max_records_per_round: 512
+  max_records_per_round: 8
 training:
   trigger: emit_only
   base_train_config: configs/train/lora_2509_diffusers.yaml
