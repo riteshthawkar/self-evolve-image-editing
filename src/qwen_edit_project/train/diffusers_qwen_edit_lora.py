@@ -173,9 +173,9 @@ class PreparedEditBatch:
     model_input: torch.Tensor
     image_latents: torch.Tensor
     prompt_embeds: torch.Tensor
-    prompt_embeds_mask: torch.Tensor
+    prompt_embeds_mask: torch.Tensor | None
     img_shapes: list[list[tuple[int, int, int]]]
-    txt_seq_lens: list[int]
+    txt_seq_lens: list[int] | None
     target_height: int
     target_width: int
 
@@ -253,15 +253,19 @@ def encode_edit_example(
             (1, vae_height // vae_scale_factor // 2, vae_width // vae_scale_factor // 2),
         ]
     ]
-    txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
+    if prompt_embeds_mask is not None:
+        prompt_embeds_mask = prompt_embeds_mask.to(device=accelerator.device)
+        txt_seq_lens = [int(value) for value in prompt_embeds_mask.sum(dim=1).tolist()]
+    else:
+        txt_seq_lens = None
 
     return PreparedEditBatch(
         model_input=model_input,
         image_latents=image_latents,
         prompt_embeds=prompt_embeds.to(device=accelerator.device, dtype=weight_dtype),
-        prompt_embeds_mask=prompt_embeds_mask.to(device=accelerator.device),
+        prompt_embeds_mask=prompt_embeds_mask,
         img_shapes=img_shapes,
-        txt_seq_lens=[int(value) for value in txt_seq_lens],
+        txt_seq_lens=txt_seq_lens,
         target_height=target_height,
         target_width=target_width,
     )
