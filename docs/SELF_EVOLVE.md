@@ -100,6 +100,11 @@ medium-difficulty editor-training samples:
 - all candidates accepted is treated as probably too easy
 - high CEPR++ semantic edit, preservation, and validity scores increase proposer reward
 
+The final editor update uses CEPR-weighted SFT. Accepted candidates receive full weight. Rejected
+candidates are included only when they are still valid, preserve the source sufficiently, and have a
+non-trivial CEPR edit score; these borderline candidates receive a small fractional weight. Invalid,
+preservation-failed, or no-edit candidates receive zero weight and are not used as editor targets.
+
 The next round can then load the proposer LoRA checkpoint and generate stronger image-grounded edit
 instructions. This gives a round-level co-training schedule:
 
@@ -136,6 +141,8 @@ outputs/self_evolve/<run_name>/round_01/proposals.jsonl
 outputs/self_evolve/<run_name>/round_01/proposal_plan.jsonl
 outputs/self_evolve/<run_name>/round_01/progress.json
 outputs/self_evolve/<run_name>/round_01/train_manifest.json
+outputs/self_evolve/<run_name>/round_01/train_weights.jsonl
+outputs/self_evolve/<run_name>/round_01/train_weight_summary.json
 outputs/self_evolve/<run_name>/round_01/accepted/images/*.png
 outputs/self_evolve/<run_name>/round_01/summary.json
 outputs/self_evolve/<run_name>/self_evolve.log
@@ -154,6 +161,7 @@ skipped, and in-progress rounds skip proposal groups that already have all candi
 
 `progress.json` and `self_evolve.log` are the main monitoring files. `progress.json` contains the
 current round status, candidate rows written, accepted count, acceptance rate, and elapsed time.
+`train_weights.jsonl` records the CEPR-derived SFT weight decision for every candidate.
 
 ## Running the loop
 

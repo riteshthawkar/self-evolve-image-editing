@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sys
 import time
 from collections import defaultdict
@@ -109,6 +110,16 @@ def _append_flag(command: list[str], flag: str, value: Any) -> None:
             command.append(flag)
         return
     command.extend([flag, str(value)])
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return default
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
 
 
 class SelfEvolveRunner:
@@ -449,49 +460,159 @@ class SelfEvolveRunner:
             if hasattr(self.proposer, "set_checkpoint_path"):
                 self.proposer.set_checkpoint_path(checkpoint_path)
 
-    def _write_manifest(self, accepted: list[AcceptedSample], manifest_path: Path) -> tuple[Path, int]:
+    def _candidate_training_weight(self, payload: dict[str, Any]) -> tuple[float, str]:
         allowed_verifiers = self.config.get("output", {}).get("train_verifiers")
         allowed_verifier_set = set(allowed_verifiers) if allowed_verifiers else None
+        proposal = payload.get("proposal", {})
+        if allowed_verifier_set is not None and proposal.get("verifier") not in allowed_verifier_set:
+            return 0.0, "verifier_filtered"
+        if not payload.get("edited_image_path"):
+            return 0.0, "missing_edited_image"
+
+        training_cfg = self.config.get("training", {})
+        weighted_cfg = dict(training_cfg.get("weighted_sft", {}))
+        weighted_enabled = bool(weighted_cfg.get("enabled", False))
+        status = str(payload.get("status", ""))
+        if status == "accepted":
+            return float(weighted_cfg.get("accepted_weight", 1.0)), "accepted"
+        if not weighted_enabled:
+            return 0.0, "not_accepted"
+        if not bool(weighted_cfg.get("include_rejected", True)):
+            return 0.0, "rejected_disabled"
+        if status != "rejected":
+            return 0.0, f"status_{status}"
+
+        evaluator_cfg = self.config.get("evaluator", self.config.get("solver", {})) or {}
+        evaluation = payload.get("evaluator") or payload.get("solver") or {}
+        component_scores = evaluation.get("component_scores", {}) if isinstance(evaluation, dict) else {}
+        signals = evaluation.get("signals", {}) if isinstance(evaluation, dict) else {}
+
+        raw_reward = _finite_float(
+            component_scores.get("cepr_raw_reward"),
+            _finite_float(evaluation.get("total_score"), _finite_float(payload.get("total_score"))),
+        )
+        semantic_edit = max(
+            _finite_float(component_scores.get("cepr_semantic_edit")),
+            _finite_float(component_scores.get("cepr_edit_specificity")),
+            _finite_float(component_scores.get("cepr_edit")),
+        )
+        preservation = _finite_float(component_scores.get("cepr_preservation"), _finite_float(signals.get("preservation")))
+        validity = _finite_float(component_scores.get("cepr_validity"), _finite_float(signals.get("validity")))
+        taxonomy = _finite_float(component_scores.get("cepr_taxonomy"), 1.0)
+
+        reward_threshold = float(weighted_cfg.get("target_reward", evaluator_cfg.get("reward_threshold", 0.30)))
+        min_raw_reward = float(weighted_cfg.get("min_raw_reward", reward_threshold * 0.5))
+        min_semantic_edit = float(
+            weighted_cfg.get("min_semantic_edit", float(evaluator_cfg.get("edit_threshold", 0.45)) * 0.5)
+        )
+        min_preservation = float(
+            weighted_cfg.get("min_preservation", evaluator_cfg.get("preservation_threshold", 0.20))
+        )
+        min_validity = float(weighted_cfg.get("min_validity", evaluator_cfg.get("validity_threshold", 0.50)))
+        min_taxonomy = float(weighted_cfg.get("min_taxonomy", 0.0))
+
+        if validity < min_validity:
+            return 0.0, "validity_below_threshold"
+        if preservation < min_preservation:
+            return 0.0, "preservation_below_threshold"
+        if semantic_edit < min_semantic_edit:
+            return 0.0, "semantic_edit_below_threshold"
+        if taxonomy < min_taxonomy:
+            return 0.0, "taxonomy_below_threshold"
+        if raw_reward < min_raw_reward:
+            return 0.0, "reward_below_threshold"
+
+        min_weight = float(weighted_cfg.get("min_rejected_weight", 0.05))
+        max_weight = float(weighted_cfg.get("max_rejected_weight", 0.50))
+        score_power = float(weighted_cfg.get("score_power", 1.0))
+        normalized = _clamp((raw_reward - min_raw_reward) / max(reward_threshold - min_raw_reward, 1e-6))
+        normalized = normalized**max(score_power, 1e-6)
+        return min_weight + (max_weight - min_weight) * normalized, "cepr_weighted_rejected"
+
+    def _training_records_from_payloads(
+        self,
+        candidate_payloads: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        audit: list[dict[str, Any]] = []
+        for payload in candidate_payloads:
+            weight, reason = self._candidate_training_weight(payload)
+            evaluation = payload.get("evaluator") or payload.get("solver") or {}
+            proposal = payload.get("proposal", {})
+            audit_row = {
+                "group_id": payload.get("group_id"),
+                "candidate_index": payload.get("candidate_index"),
+                "record_key": payload.get("record_key"),
+                "status": payload.get("status"),
+                "instruction": proposal.get("instruction"),
+                "sample_weight": weight,
+                "weight_reason": reason,
+                "edited_image": payload.get("edited_image_path"),
+                "scores": {
+                    "total_score": evaluation.get("total_score") if isinstance(evaluation, dict) else None,
+                    "component_scores": evaluation.get("component_scores", {}) if isinstance(evaluation, dict) else {},
+                },
+            }
+            audit.append(audit_row)
+            if weight <= 0:
+                continue
+            edited_path = resolve_path(str(payload.get("edited_image_path", "")))
+            source_path = resolve_path(str(payload.get("image_path", "")))
+            if edited_path is None or source_path is None or not edited_path.exists() or not source_path.exists():
+                audit_row["sample_weight"] = 0.0
+                audit_row["weight_reason"] = "missing_training_image"
+                continue
+            records.append(
+                {
+                    "prompt": str(proposal.get("instruction", "")),
+                    "image": relative_to_repo(edited_path),
+                    "edit_image": relative_to_repo(source_path),
+                    "sample_weight": round(float(weight), 6),
+                    "record_key": payload.get("record_key"),
+                    "group_id": payload.get("group_id"),
+                    "candidate_index": payload.get("candidate_index"),
+                    "candidate_status": payload.get("status"),
+                    "weight_reason": reason,
+                    "operation_id": proposal.get("operation_id"),
+                    "family": proposal.get("family"),
+                    "structured_edit": proposal.get("structured_edit", {}),
+                    "scores": audit_row["scores"],
+                }
+            )
+        included = len(records)
+        weight_sum = sum(float(record.get("sample_weight", 1.0)) for record in records)
+        accepted_included = sum(1 for record in records if record.get("candidate_status") == "accepted")
+        rejected_included = sum(1 for record in records if record.get("candidate_status") == "rejected")
+        summary = {
+            "candidates": len(candidate_payloads),
+            "included": included,
+            "accepted_included": accepted_included,
+            "rejected_included": rejected_included,
+            "weight_sum": weight_sum,
+            "avg_weight": weight_sum / max(included, 1),
+        }
+        return records, audit, summary
+
+    def _write_manifest_records(
+        self,
+        training_records: list[dict[str, Any]],
+        manifest_path: Path,
+    ) -> tuple[Path, int, float]:
         training_cfg = self.config.get("training", {})
         replay_ratio = float(training_cfg.get("reconstruction_replay_ratio", 0.0))
+        replay_weight = float(training_cfg.get("reconstruction_replay_weight", 0.50))
         replay_prompt = str(
             training_cfg.get(
                 "reconstruction_replay_prompt",
                 "Reconstruct the input image exactly. Preserve all content, layout, colors, and text.",
             )
         )
-        manifest_records = []
-        accepted_records = []
+        manifest_records = list(training_records)
         replay_source_paths: list[Path] = []
-        for sample in accepted:
-            if allowed_verifier_set is not None and sample.proposal.definition.verifier not in allowed_verifier_set:
-                continue
-            replay_source_paths.append(sample.record.image_path)
-            manifest_records.append(
-                {
-                    "prompt": sample.proposal.instruction,
-                    "image": relative_to_repo(sample.edited_image_path),
-                    "edit_image": relative_to_repo(sample.record.image_path),
-                }
-            )
-            accepted_records.append(
-                {
-                    "record_key": sample.record.key,
-                    "original_image": relative_to_repo(sample.record.image_path),
-                    "edited_image": relative_to_repo(sample.edited_image_path),
-                    "instruction": sample.proposal.instruction,
-                    "operation_id": sample.proposal.definition.operation_id,
-                    "difficulty": sample.proposal.definition.difficulty,
-                    "structured_edit": sample.proposal.structured_edit,
-                    "candidate_index": sample.candidate_index,
-                    "scores": {
-                        "global_score": sample.evaluation_result.global_score,
-                        "local_score": sample.evaluation_result.local_score,
-                        "total_score": sample.evaluation_result.total_score,
-                        "component_scores": sample.evaluation_result.component_scores,
-                    },
-                }
-            )
+        for record in training_records:
+            source_path = resolve_path(str(record.get("edit_image", "")))
+            if source_path is not None:
+                replay_source_paths.append(source_path)
         if replay_ratio > 0 and manifest_records and replay_source_paths:
             replay_count = max(1, round(len(manifest_records) * replay_ratio))
             unique_sources = list(dict.fromkeys(replay_source_paths))
@@ -502,19 +623,14 @@ class SelfEvolveRunner:
                         "prompt": replay_prompt,
                         "image": relative_to_repo(source_path),
                         "edit_image": relative_to_repo(source_path),
-                    }
-                )
-                accepted_records.append(
-                    {
-                        "type": "reconstruction_replay",
-                        "original_image": relative_to_repo(source_path),
-                        "edited_image": relative_to_repo(source_path),
-                        "instruction": replay_prompt,
+                        "sample_weight": replay_weight,
+                        "candidate_status": "reconstruction_replay",
                     }
                 )
         save_json(manifest_records, manifest_path)
-        write_jsonl(accepted_records, manifest_path.with_suffix(".jsonl"))
-        return manifest_path, len(manifest_records)
+        write_jsonl(manifest_records, manifest_path.with_suffix(".jsonl"))
+        weight_sum = sum(float(record.get("sample_weight", 1.0)) for record in manifest_records)
+        return manifest_path, len(manifest_records), weight_sum
 
     def _run_training_round(self, round_index: int, round_dir: Path, manifest_path: Path) -> dict[str, Any] | None:
         training_cfg = self.config.get("training", {})
@@ -766,6 +882,7 @@ class SelfEvolveRunner:
             resume_enabled,
         )
         cumulative_accepted: list[AcceptedSample] = []
+        cumulative_training_records: list[dict[str, Any]] = []
 
         for round_index in range(1, num_rounds + 1):
             round_started_at = time.time()
@@ -786,12 +903,15 @@ class SelfEvolveRunner:
                     candidate_rows = read_jsonl(proposals_path)
                     accepted_from_round = self._accepted_samples_from_payloads(candidate_rows)
                     cumulative_accepted.extend(accepted_from_round)
+                    training_records_from_round, _, _ = self._training_records_from_payloads(candidate_rows)
+                    cumulative_training_records.extend(training_records_from_round)
                     self._restore_completed_round_state(round_summary)
                     overall_summary["rounds"].append(round_summary)
                     self.logger.info(
-                        "Round %02d already completed; restored %s accepted samples and skipped generation/training.",
+                        "Round %02d already completed; restored %s accepted samples, %s training records, and skipped generation/training.",
                         round_index,
                         len(accepted_from_round),
+                        len(training_records_from_round),
                     )
                     continue
 
@@ -1024,8 +1144,17 @@ class SelfEvolveRunner:
                 persisted_preference_path = write_jsonl(preference_records, preference_path)
             manifest_path = round_dir / "train_manifest.json"
             cumulative_accepted.extend(accepted)
-            manifest_samples = cumulative_accepted if use_cumulative_manifest else accepted
-            _, train_manifest_sample_count = self._write_manifest(manifest_samples, manifest_path)
+            round_training_records, training_weight_audit, training_weight_summary = self._training_records_from_payloads(
+                candidate_payloads
+            )
+            cumulative_training_records.extend(round_training_records)
+            manifest_samples = cumulative_training_records if use_cumulative_manifest else round_training_records
+            train_weight_audit_path = write_jsonl(training_weight_audit, round_dir / "train_weights.jsonl")
+            save_json(training_weight_summary, round_dir / "train_weight_summary.json")
+            _, train_manifest_sample_count, train_manifest_weight_sum = self._write_manifest_records(
+                manifest_samples,
+                manifest_path,
+            )
 
             accepted_scores = [sample.evaluation_result.total_score for sample in accepted]
             global_scores = [sample.evaluation_result.global_score for sample in accepted]
@@ -1051,12 +1180,18 @@ class SelfEvolveRunner:
                     "candidate_rows_written": total_candidates,
                     "accepted": len(accepted),
                     "acceptance_rate": acceptance_rate,
+                    "train_manifest_samples": train_manifest_sample_count,
+                    "train_manifest_weight_sum": train_manifest_weight_sum,
                     "elapsed_seconds": round(time.time() - round_started_at, 3),
                     "proposals_path": str(proposals_path),
                     "manifest_path": str(manifest_path),
                 },
             )
-            training_result = self._run_training_round(round_index, round_dir, manifest_path) if accepted else None
+            training_result = (
+                self._run_training_round(round_index, round_dir, manifest_path)
+                if train_manifest_sample_count > 0
+                else None
+            )
             proposer_training_result = self._run_proposer_training_round(round_index, round_dir, candidate_payloads)
 
             round_summary = {
@@ -1069,7 +1204,10 @@ class SelfEvolveRunner:
                 "candidates": total_candidates,
                 "accepted": len(accepted),
                 "cumulative_accepted": len(cumulative_accepted),
+                "round_training_samples": len(round_training_records),
+                "round_training_weight_sum": training_weight_summary["weight_sum"],
                 "train_manifest_samples": train_manifest_sample_count,
+                "train_manifest_weight_sum": train_manifest_weight_sum,
                 "acceptance_rate": acceptance_rate,
                 "avg_total_score": (sum(accepted_scores) / len(accepted_scores)) if accepted_scores else 0.0,
                 "avg_global_score": (sum(global_scores) / len(global_scores)) if global_scores else 0.0,
@@ -1088,6 +1226,8 @@ class SelfEvolveRunner:
                 },
                 "elapsed_seconds": round(time.time() - round_started_at, 3),
                 "proposals_path": str(proposals_path),
+                "train_weights_path": str(train_weight_audit_path),
+                "train_weight_summary": training_weight_summary,
                 "evaluator_training_path": (
                     str(persisted_evaluator_training_path) if persisted_evaluator_training_path is not None else None
                 ),
@@ -1119,6 +1259,8 @@ class SelfEvolveRunner:
                     "candidate_rows_written": total_candidates,
                     "accepted": len(accepted),
                     "acceptance_rate": acceptance_rate,
+                    "train_manifest_samples": train_manifest_sample_count,
+                    "train_manifest_weight_sum": train_manifest_weight_sum,
                     "elapsed_seconds": round(time.time() - round_started_at, 3),
                     "summary_path": str(summary_path),
                     "proposals_path": str(proposals_path),

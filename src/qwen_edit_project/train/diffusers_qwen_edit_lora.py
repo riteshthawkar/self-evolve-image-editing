@@ -133,11 +133,15 @@ class EditManifestDataset(Dataset):
             source_image = record.get(condition_image_key)
             if not prompt or not target_image or not source_image:
                 continue
+            sample_weight = float(record.get("sample_weight", 1.0))
+            if not math.isfinite(sample_weight) or sample_weight < 0:
+                raise ValueError(f"Invalid sample_weight={sample_weight!r} in {manifest_path}")
             self.examples.append(
                 {
                     "prompt": str(prompt),
                     "target_path": resolve_record_path(base_path, str(target_image)),
                     "source_path": resolve_record_path(base_path, str(source_image)),
+                    "sample_weight": sample_weight,
                 }
             )
         if not self.examples:
@@ -743,10 +747,11 @@ def main() -> None:
 
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
                 target = noise - model_input
+                sample_weight = float(example.get("sample_weight", 1.0))
                 loss = torch.mean(
                     (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
                     dim=1,
-                ).mean()
+                ).mean() * sample_weight
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -777,7 +782,11 @@ def main() -> None:
                     accelerator.save_state(save_path)
                     logger.info("Saved state to %s", save_path)
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {
+                "loss": loss.detach().item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+                "sample_weight": sample_weight,
+            }
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
