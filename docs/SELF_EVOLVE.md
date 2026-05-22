@@ -127,6 +127,9 @@ weighted targets, gives the proposer multiple reward observations before a LoRA 
 updates far more frequently than a 64- or 256-image round. Single-image updates provide only 4
 candidate edits, so a reward outlier can dominate the update and the proposer reward becomes too
 noisy.
+The default also uses `output.use_cumulative_manifest=false`; past learning is carried by the
+continued editor/proposer checkpoints, while each update trains on the current shard to avoid
+quadratic retraining cost across many micro-rounds.
 
 Use:
 

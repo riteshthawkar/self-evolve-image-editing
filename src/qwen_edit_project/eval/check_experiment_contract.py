@@ -104,6 +104,12 @@ def check_self_evolve_config(path: str | Path, errors: list[str]) -> None:
             f"{prefix}.curriculum.num_rounds",
             errors,
         )
+        require_equal(
+            config.get("output", {}).get("use_cumulative_manifest"),
+            False,
+            f"{prefix}.output.use_cumulative_manifest",
+            errors,
+        )
     editor = config.get("editor", {})
     require_equal(editor.get("backend"), "qwen_edit", f"{prefix}.editor.backend", errors)
     check_generation(f"{prefix}.editor", editor.get("generation", {}), errors)
