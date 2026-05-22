@@ -40,6 +40,64 @@ The main method is `internal-cepr`, documented in [Internal CEPR Reward](INTERNA
 bash scripts/run_self_evolve_matrix.sh --variant internal-cepr --images-dir data/unlabeled/self_evolve
 ```
 
+## Backend Discipline For Trained Checkpoints
+
+There are two valid backend roles:
+
+- `official_diffusers`: the paper-matched base Qwen-Image-Edit-2509 inference anchor.
+- `diffsynth`: the legacy trainable backend that writes and reloads DiffSynth-format LoRA/full checkpoints.
+
+Self-evolve round 1 may generate pseudo-labels with the official Diffusers base policy. Once a
+DiffSynth training round produces a checkpoint, later self-evolve rounds must reload that checkpoint
+with `editor.model.backend=diffsynth`. The runner enforces this through:
+
+```yaml
+training:
+  continue_with_trained_checkpoint: true
+  trained_checkpoint_backend: diffsynth
+```
+
+When starting self-evolve from an existing LoRA/full checkpoint, pass the model type and let the
+matrix runner choose the compatible backend:
+
+```bash
+bash scripts/run_self_evolve_matrix.sh \
+  --variant internal-cepr \
+  --checkpoint outputs/checkpoints/Qwen-Image-Edit-2509_lora/<ckpt>.safetensors \
+  --editor-model-type lora
+```
+
+Override `--editor-backend` only when the checkpoint format is known to match the requested loader.
+
+For the paper-grade path, prefer the Diffusers-native edit LoRA trainer:
+
+```bash
+bash scripts/train_lora_2509_diffusers.sh \
+  --set dataset.dataset_base_path=. \
+  --set dataset.dataset_metadata_path=outputs/self_evolve/<run>/internal-cepr/round_01/train_manifest.json
+```
+
+In self-evolve, use it by selecting the train config:
+
+```bash
+bash scripts/run_self_evolve_matrix.sh \
+  --variant internal-cepr \
+  --train-config configs/train/lora_2509_diffusers.yaml \
+  --launch-training
+```
+
+This trainer follows the Diffusers `QwenImageEditPlusPipeline` conditioning path and saves
+Diffusers-compatible LoRA weights. Its config declares:
+
+```yaml
+output:
+  checkpoint_backend: official_diffusers
+```
+
+so later self-evolve rounds reload the trained LoRA through the same official Diffusers backend.
+The default Diffusers config writes resumable checkpoints every 100 optimizer steps; resume with
+`--set training.resume_from_checkpoint=latest` or point it at a specific `checkpoint-<step>` directory.
+
 ## Qwen-Style Preservation Pressure
 
 The Qwen report emphasizes edit consistency through a multi-task setup that includes reconstruction pressure. Our post-training is much smaller, but the same principle is built into the manifest writer:

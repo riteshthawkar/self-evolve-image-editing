@@ -60,6 +60,8 @@ training:
   trigger: emit_only
   base_train_config: configs/train/lora_2509.yaml
   current_checkpoint_path: null
+  continue_with_trained_checkpoint: true
+  trained_checkpoint_backend: diffsynth
   reconstruction_replay_ratio: 0.15
   reconstruction_replay_prompt: Reconstruct the input image exactly. Preserve all content, layout, colors, and text.
 output:

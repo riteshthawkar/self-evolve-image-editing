@@ -10,6 +10,16 @@ dataset:
 proposer:
   backend: scripted
   families: []
+  operation_ids:
+    - brightness_up
+    - brightness_down
+    - saturation_up
+    - saturation_down
+    - contrast_up
+    - contrast_down
+    - warm_tone
+    - cool_tone
+    - grayscale
 editor:
   backend: pillow_demo
   device: auto

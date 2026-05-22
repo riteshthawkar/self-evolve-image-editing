@@ -99,33 +99,35 @@ The download and metadata writing are resumable. Re-running the job skips alread
 First run the pilot:
 
 ```bash
-sbatch --export=ALL,MANIFEST=data/unlabeled/splits/coco2017/pilot_manifest.jsonl,LIMIT=128,SAMPLES_PER_PROPOSAL=2,MAX_RECORDS_PER_ROUND=128,RUN_NAME=delta_ranker_pilot \
+sbatch --export=ALL,MANIFEST=data/unlabeled/splits/coco2017/pilot_manifest.jsonl,LIMIT=128,SAMPLES_PER_PROPOSAL=4,MAX_RECORDS_PER_ROUND=128,RUN_NAME=delta_results_pilot \
   scripts/slurm/02_self_evolve_delta_ranker.sbatch
 ```
 
 Then run the main split:
 
 ```bash
-sbatch --export=ALL,MANIFEST=data/unlabeled/splits/coco2017/main_manifest.jsonl,LIMIT=512,SAMPLES_PER_PROPOSAL=2,MAX_RECORDS_PER_ROUND=256,RUN_NAME=delta_ranker_main \
+sbatch --export=ALL,MANIFEST=data/unlabeled/splits/coco2017/main_manifest.jsonl,LIMIT=512,SAMPLES_PER_PROPOSAL=4,MAX_RECORDS_PER_ROUND=512,RUN_NAME=delta_results_main \
   scripts/slurm/02_self_evolve_delta_ranker.sbatch
 ```
 
-Increase `SAMPLES_PER_PROPOSAL` to `4` only after the pilot shows a reasonable acceptance rate.
+The default Slurm self-evolve job now runs the `delta-results` variant with `K=4` candidates. This
+is the results-first path: proxy-verifiable edits enter the editor training manifest, while Qwen
+internal features are required as an auxiliary check. Set `VARIANT=delta-grounded` only if you want
+the broader exploratory taxonomy.
 
 ## LoRA Training From Self-Evolve Output
 
 Self-evolve writes DiffSynth-compatible training manifests:
 
 ```text
-outputs/self_evolve/<run>/delta-ranker/round_01/train_manifest.json
-outputs/self_evolve/<run>/delta-ranker/round_02/train_manifest.json
-outputs/self_evolve/<run>/delta-ranker/round_03/train_manifest.json
+outputs/self_evolve/<run>/delta-results/round_01/train_manifest.json
+outputs/self_evolve/<run>/delta-results/round_02/train_manifest.json
 ```
 
 Train on the latest round:
 
 ```bash
-sbatch --export=ALL,TRAIN_MANIFEST=outputs/self_evolve/delta_ranker_main/delta-ranker/round_03/train_manifest.json,RUN_NAME=delta_ranker_lora_r03 \
+sbatch --export=ALL,TRAIN_MANIFEST=outputs/self_evolve/delta_results_main/delta-results/round_02/train_manifest.json,RUN_NAME=delta_results_lora_r02 \
   scripts/slurm/03_train_lora_from_manifest.sbatch
 ```
 
@@ -136,14 +138,14 @@ If GPU memory is still comfortable, increase data before increasing LoRA rank. F
 Evaluate a trained LoRA checkpoint:
 
 ```bash
-sbatch --export=ALL,CHECKPOINT=outputs/checkpoints/delta_ranker_lora_r03/<ckpt>.safetensors,MODEL_NAME=delta_ranker_lora_r03 \
+sbatch --export=ALL,CHECKPOINT=outputs/checkpoints/delta_results_lora_r02/<ckpt>.safetensors,MODEL_NAME=delta_results_lora_r02 \
   scripts/slurm/04_eval_edit_suite.sbatch
 ```
 
 For a quick sanity check:
 
 ```bash
-sbatch --export=ALL,CHECKPOINT=outputs/checkpoints/delta_ranker_lora_r03/<ckpt>.safetensors,MODEL_NAME=delta_ranker_lora_r03,LIMIT=64 \
+sbatch --export=ALL,CHECKPOINT=outputs/checkpoints/delta_results_lora_r02/<ckpt>.safetensors,MODEL_NAME=delta_results_lora_r02,LIMIT=64 \
   scripts/slurm/04_eval_edit_suite.sbatch
 ```
 
@@ -153,9 +155,12 @@ Run these in order:
 
 ```text
 baseline Qwen-Image-Edit
-raw source pool + delta-ranker
-heuristic-filtered source pool + delta-ranker
-open-VLM-filtered source pool + delta-ranker
+raw source pool + delta-results
+heuristic-filtered source pool + delta-results
+open-VLM-filtered source pool + delta-results
+open-VLM-filtered source pool + EvoLMM-style generic self-reward
+open-VLM-filtered source pool + broader delta-grounded
+open-VLM-filtered source pool + old proxy-only delta-ranker
 open-VLM-filtered source pool + hybrid reward
 ```
 
@@ -165,6 +170,7 @@ The most important metric is not only final benchmark score. Track:
 - accepted self-evolve samples per GPU hour
 - evaluator rejection reasons
 - train manifest size per round
+- preservation of non-edited regions after the same training budget
 - edit benchmark score after the same LoRA budget
 
 This gives a defensible paper story: the source-image filter is useful if it improves the efficiency and reliability of self-evolving image editing, not just if it makes images look cleaner.

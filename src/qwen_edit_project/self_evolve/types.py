@@ -36,10 +36,11 @@ class EditProposal:
     definition: ProposalDefinition
     difficulty_level: int
     instruction: str
+    structured_edit: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class SolverResult:
+class EvaluationResult:
     global_score: float
     local_score: float
     total_score: float
@@ -48,10 +49,19 @@ class SolverResult:
     component_scores: dict[str, float] = field(default_factory=dict)
 
 
+# Backward-compatible alias for older configs, manifests, and helper scripts.
+SolverResult = EvaluationResult
+
+
 @dataclass
 class AcceptedSample:
     record: UnlabeledImageRecord
     proposal: EditProposal
     edited_image_path: Path
-    solver_result: SolverResult
+    evaluation_result: EvaluationResult
     candidate_index: int = 0
+
+    @property
+    def solver_result(self) -> EvaluationResult:
+        """Backward-compatible name used by older manifests/helpers."""
+        return self.evaluation_result

@@ -1,6 +1,22 @@
 # Internal CEPR Reward
 
-The main method uses **Contrastive Edit-Preservation Reward (CEPR)**. It is an internal-only reward computed from the editor itself, not from GPT-4V, CLIP, detectors, OCR, or any external reward model.
+The main method uses **Contrastive Edit-Preservation Reward (CEPR)**. CEPR is a fixed
+reward evaluator, not a third trainable agent. The trainable roles are the proposer and the
+editor; CEPR only scores candidate edited images and decides which samples enter editor
+training.
+
+CEPR is internal-only: it does not use GPT-4V, CLIP, detectors, OCR, or any external reward
+model. Instead, it reuses Qwen-Image-Edit internal representations that are already loaded for
+the editor:
+
+- prompt-conditioned Qwen understanding features for the original and edited image
+- Qwen text or prompt anchor features
+- Qwen VAE latents for locality and preservation checks
+
+The current implementation reuses the loaded editor pipeline for these feature reads. CEPR does
+not generate images, receive gradients, update LoRA weights, or save checkpoints. In config files
+the historical key `solver:` is still accepted, but the correct terminology is **evaluator** or
+**reward evaluator**.
 
 For source image `x`, instruction `c`, and candidate edit `y_i`, the reward is:
 
@@ -35,6 +51,35 @@ Delta_true_i = sim_Q(y_i, c) - sim_Q(x, c)
 ```
 
 `Delta_wrong_ij` is the same internal prompt-gain for counterfactual distractor instructions. This prevents reward hacking where the model makes a plausible but wrong edit.
+
+## Taxonomy-Aware Internal Rubric
+
+For trainable-proposer runs, CEPR also supports a structured edit rubric. The proposer emits fields
+such as:
+
+```json
+{
+  "edit_type": "object_replacement",
+  "source_object": "person",
+  "target_object": "stuffed animal",
+  "target_region": "main subject",
+  "preserve": ["background", "scene layout", "lighting"],
+  "instruction": "Replace the person with a stuffed animal while preserving the background."
+}
+```
+
+CEPR turns those fields into internal contrastive prompts and scores them with Qwen-Image-Edit
+features:
+
+- target gain: the edited image should become more similar to the requested target object,
+  attribute, material, style, or location
+- source drop: for replacement/removal/move edits, the original object or original relation should
+  become less supported
+- wrong-edit margin: the true structured edit should beat distractor edits such as wrong
+  replacement targets or unchanged-object prompts
+
+This is the internal counterpart to external VLM rubrics: the reward is decomposed by edit taxonomy,
+but all scoring still comes from Qwen-Image-Edit internal representations.
 
 ## Preservation
 

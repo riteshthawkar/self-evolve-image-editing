@@ -181,7 +181,7 @@ Example metadata line:
 
 ### Source image selection
 
-For the delta-ranker path, filter the raw unlabeled pool before self-evolve:
+For the results-first delta path, filter the raw unlabeled pool before self-evolve:
 
 ```bash
 bash scripts/select_unlabeled_images.sh \
@@ -193,7 +193,7 @@ Then run self-evolve from the selected manifest:
 
 ```bash
 bash scripts/run_self_evolve_matrix.sh \
-  --variant delta-ranker \
+  --variant delta-results \
   --set dataset.source=jsonl \
   --set dataset.manifest_jsonl=data/unlabeled/selected/manifest.jsonl \
   --limit 128
@@ -214,6 +214,14 @@ bash scripts/prepare_remote_data.sh \
 This writes raw images, VLM-filtered selected manifests, and pilot/main/heldout splits under `data/unlabeled/`. See [REMOTE_DATA_PIPELINE.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/REMOTE_DATA_PIPELINE.md).
 
 ## 3. Edit benchmark assets
+
+Prepare benchmark assets with:
+
+```bash
+bash scripts/prepare_benchmark_data.sh --stage all
+```
+
+See [BENCHMARK_DATA_SETUP.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/BENCHMARK_DATA_SETUP.md) for stage-by-stage setup and checks.
 
 ### GEdit-Bench
 

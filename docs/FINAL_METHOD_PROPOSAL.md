@@ -2,6 +2,9 @@
 
 This is the concrete method proposal to use going forward unless experiments force a change.
 
+For the paper storyline and ablation map, see
+[PAPER_STORY_AND_ABLATIONS.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/PAPER_STORY_AND_ABLATIONS.md).
+
 ## Chosen Architecture
 
 We will use:

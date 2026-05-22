@@ -26,7 +26,7 @@ The idea is still **plausibly novel** if it is framed as:
 
 Use this as the paper-level claim:
 
-> We study self-evolving image editing from raw images using a proposer-editor-solver loop. The proposer generates candidate edit instructions, the editor applies them, and the solver assigns an editing-specific continuous reward that separates instruction satisfaction from preservation of unchanged content. Accepted edits become pseudo-labels for the next round of training, while the proposer is optimized toward moderate-difficulty edits rather than arbitrarily hard ones.
+> We study self-evolving image editing from raw images using a proposer-editor-solver loop. The proposer generates candidate edit instructions, the editor samples multiple direct image-editing candidates, and the solver assigns an editing-specific delta-grounded reward that separates requested edit success from preservation of unchanged content. Accepted edits become pseudo-labels for the next round of training, while the ablations show why generic reasoning-style self-rewards are insufficient for image editing.
 
 This is the safest concise version.
 
@@ -59,9 +59,28 @@ The last two are especially strong if the experiments support them.
 | --- | --- | --- |
 | EvoLMM / SQLM | Self-evolving proposer-solver training, continuous or uncertainty-shaped rewards, learning frontier curriculum | They are not image editing systems and they do not solve the preservation problem specific to editing |
 | UniCorn / MM-Zero | Multi-role self-evolving multimodal systems, including proposer, solver, judge, and generated supervision | They are closer to reasoning or generation than instruction-guided image editing with source-image preservation |
+| JarvisEvo | Self-evolving photo-editing agent with supervised cold-start data, human/evaluator annotations, Gemini-assisted data construction, and Lightroom/tool execution | It improves an agentic tool-orchestration policy, not a native image-editing generator through delta-grounded filtering of its own edited images |
 | HIVE / InstructRL4Pix / Edit-R1 / ImageEdit-R1 | RL for image editing and editing improvement via learned or implicit rewards | They do not define the same raw-image proposer-editor-solver self-evolving curriculum centered on preservation-aware acceptance |
 | EditReward / EditScore / SpatialReward | Strong evidence that image editing needs specialized rewards and spatial reasoning | They motivate our solver design, but they are not themselves proposer-driven self-evolution methods |
 | D3PO / InPO / DGPO / mDPO | Preference optimization and groupwise alignment for diffusion models | These are useful optimization layers for accepted vs rejected edits, but not the full self-evolving editing framework |
+
+## JarvisEvo Is Adjacent, Not A Direct Baseline
+
+JarvisEvo should be cited and discussed because it uses the language of self-evolving photo editing.
+However, the method class is different from ours.
+
+JarvisEvo relies on:
+
+- cold-start supervised fine-tuning on large labeled editing/evaluation traces
+- human-annotated evaluator calibration
+- Gemini-assisted instruction generation, annotation, filtering, and reflection generation
+- an external Lightroom-style tool space for actual image edits
+
+Our method instead targets a native image-editing generator. Qwen-Image-Edit directly produces
+edited pixels from the source image and instruction; our loop then ranks and filters those candidate
+images using requested-change and preservation deltas. This lets us claim a different contribution:
+self-evolution for direct generative image editing, not self-evolution for an external-tool editing
+agent.
 
 ## Strongest Version Of The Paper
 
@@ -71,7 +90,7 @@ The strongest version is not:
 
 The strongest version is:
 
-> A self-evolving image editing framework in which a proposer generates edit instructions on raw images, an editor produces candidate edits, and an editing-specific solver uses decomposed continuous reward to filter and rank those candidates. The key technical contribution is the reward design: instruction satisfaction, preservation, localization, cycle consistency, and optionally internal-feature verification, together with an uncertainty-shaped proposer curriculum.
+> A self-evolving image editing framework in which a proposer generates edit instructions on raw images, an editor produces candidate edits, and an editing-specific solver uses decomposed continuous reward to filter and rank those candidates. The key technical contribution is the training pipeline and reward design: instruction satisfaction, preservation, localization, counterfactual edit discrimination, candidate-relative ranking, and optionally internal-feature verification, together with an uncertainty-shaped proposer curriculum.
 
 This framing is specific enough to be distinct and broad enough to support multiple ablations.
 
@@ -105,9 +124,10 @@ The cleanest experimental story is:
 
 1. supervised Qwen-Image-Edit baseline
 2. naive self-training baseline
-3. proposer-editor-solver with plain proxy reward
-4. proposer-editor-solver with decomposed preservation-aware reward
-5. proposer-editor-solver with uncertainty-shaped proposer reward
-6. optional internal-feature verifier or preference-optimization extension
+3. EvoLMM-style generic continuous self-reward baseline
+4. proposer-editor-solver with plain proxy reward
+5. proposer-editor-solver with decomposed preservation-aware reward
+6. proposer-editor-solver with counterfactual and relative candidate ranking
+7. optional internal-feature verifier or preference-optimization extension
 
 This lets us show that the contribution is not simply "more synthetic data", but **better self-generated data because of better reward design**.

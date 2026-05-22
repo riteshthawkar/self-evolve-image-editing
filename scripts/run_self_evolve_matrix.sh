@@ -10,7 +10,7 @@ usage() {
 Usage: bash scripts/run_self_evolve_matrix.sh [options]
 
 Options:
-  --variant NAME                base, internal-cepr, naive-self-train, evolmm-style, spatial, cycle, internal, hybrid, hybrid-scalar, delta-ranker, delta-ranker-proxy, delta-grounded, delta-results, pillow-demo, pillow-hybrid, pillow-delta-ranker, or all. Default: all
+  --variant NAME                base, internal-cepr, internal-cepr-trainable-proposer, naive-self-train, evolmm-style, spatial, cycle, internal, hybrid, hybrid-scalar, delta-ranker, delta-ranker-proxy, delta-grounded, delta-results, pillow-demo, pillow-hybrid, pillow-delta-ranker, or all. Default: all
   --limit N                     Limit number of unlabeled records.
   --images-dir PATH             Override dataset.images_dir.
   --metadata-jsonl PATH         Optional sidecar metadata for directory datasets.
@@ -19,7 +19,9 @@ Options:
   --checkpoint PATH             Starting checkpoint for qwen-based self-evolve variants.
   --checkpoint-dir PATH         Auto-discover the latest checkpoint from this directory.
   --editor-model-type TYPE      Override editor.model.model_type, for example lora or full.
+  --editor-backend BACKEND      Override editor.model.backend, for example diffsynth or official_diffusers.
   --launch-training             Set training.trigger=launch.
+  --launch-proposer-training    Set proposer.training.trigger=launch for trainable proposer variants.
   --train-config PATH           Override training.base_train_config.
   --dry-run                     Dry-run the selected self-evolve runs.
   --set KEY=VALUE               Extra override passed through to every run. Repeatable.
@@ -41,8 +43,10 @@ DTYPE=""
 CHECKPOINT=""
 CHECKPOINT_DIR=""
 EDITOR_MODEL_TYPE=""
+EDITOR_BACKEND=""
 DRY_RUN=0
 LAUNCH_TRAINING=0
+LAUNCH_PROPOSER_TRAINING=0
 TRAIN_CONFIG=""
 EXTRA_OVERRIDES=()
 
@@ -84,8 +88,15 @@ while [[ $# -gt 0 ]]; do
       EDITOR_MODEL_TYPE="$2"
       shift
       ;;
+    --editor-backend)
+      EDITOR_BACKEND="$2"
+      shift
+      ;;
     --launch-training)
       LAUNCH_TRAINING=1
+      ;;
+    --launch-proposer-training)
+      LAUNCH_PROPOSER_TRAINING=1
       ;;
     --train-config)
       TRAIN_CONFIG="$2"
@@ -111,6 +122,10 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+if (( DRY_RUN )); then
+  experiment_enable_dry_run
+fi
+
 if [[ -z "$CHECKPOINT" && -n "$CHECKPOINT_DIR" ]]; then
   CHECKPOINT="$(experiment_latest_checkpoint "$CHECKPOINT_DIR" || true)"
 fi
@@ -123,6 +138,7 @@ variant_script() {
   case "$1" in
     base) echo "scripts/self_evolve_2509.sh" ;;
     internal-cepr) echo "scripts/self_evolve_2509_internal_cepr.sh" ;;
+    internal-cepr-trainable-proposer) echo "scripts/self_evolve_2509_internal_cepr_trainable_proposer.sh" ;;
     naive-self-train) echo "scripts/self_evolve_2509.sh" ;;
     evolmm-style) echo "scripts/self_evolve_2509_evolmm_style.sh" ;;
     spatial) echo "scripts/self_evolve_2509_spatial.sh" ;;
@@ -139,6 +155,15 @@ variant_script() {
     pillow-delta-ranker) echo "scripts/self_evolve_pillow_delta_ranker.sh" ;;
     *) return 1 ;;
   esac
+}
+
+extra_override_exists() {
+  local wanted="$1"
+  local override
+  for override in "${EXTRA_OVERRIDES[@]:-}"; do
+    [[ "$override" == "$wanted="* ]] && return 0
+  done
+  return 1
 }
 
 if [[ "$VARIANT" == "all" ]]; then
@@ -197,8 +222,18 @@ for current_variant in "${variants[@]}"; do
   if [[ -n "$EDITOR_MODEL_TYPE" ]]; then
     cmd+=(--set "editor.model.model_type=$EDITOR_MODEL_TYPE")
   fi
+  if [[ -n "$EDITOR_BACKEND" ]]; then
+    cmd+=(--set "editor.model.backend=$EDITOR_BACKEND")
+  elif [[ -n "$CHECKPOINT" && -n "$EDITOR_MODEL_TYPE" && "$EDITOR_MODEL_TYPE" != "base" ]]; then
+    if ! extra_override_exists "editor.model.backend"; then
+      cmd+=(--set "editor.model.backend=diffsynth")
+    fi
+  fi
   if (( LAUNCH_TRAINING )); then
     cmd+=(--set "training.trigger=launch")
+  fi
+  if (( LAUNCH_PROPOSER_TRAINING )); then
+    cmd+=(--set "proposer.training.trigger=launch")
   fi
   if [[ -n "$TRAIN_CONFIG" ]]; then
     cmd+=(--set "training.base_train_config=$TRAIN_CONFIG")

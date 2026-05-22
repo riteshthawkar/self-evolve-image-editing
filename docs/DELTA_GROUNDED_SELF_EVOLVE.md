@@ -6,35 +6,41 @@ The goal is not just to run self-training. The goal is to make self-training sui
 
 ## Architecture
 
-The research target is:
+The research target is now:
 
 ```text
-Proposer -> Editor(K candidates) -> Evaluator -> Rank/Accept -> Train
+Structured Proposer -> Qwen Editor(K candidates) -> Delta Evaluator -> Rank/Accept -> Train
 ```
 
-- `Proposer`: generates edit instructions from raw images.
+- `Structured Proposer`: generates edit instructions from raw images using a difficulty ladder and,
+  when available, source-selection metadata such as plausible edit families.
 - `Editor`: samples multiple candidate edits for the same image and instruction.
-- `Evaluator`: checks feasibility and ranks candidates.
+- `Delta Evaluator`: checks feasibility, preservation, internal Qwen prompt gain, and candidate rank.
 - `Train`: accepted edits become pseudo-labels for the editor.
 
-The intended paper version uses one shared base model with separate role LoRAs:
+The intended paper version uses Qwen-Image-Edit as the editor and Qwen edit-conditioning
+representations as one evaluator signal:
 
-- proposer LoRA
-- editor LoRA
-- evaluator LoRA
+- editor LoRA trained from accepted pseudo-labels
+- evaluator head or LoRA trained from self-generated winner/loser pairs
+- optional proposer policy after the evaluator is calibrated
 
-The current implementation adds the candidate-group evaluator path and exports evaluator training data. The learned evaluator LoRA is the next stage after the exported labels are validated.
+The current implementation adds the candidate-group evaluator path and exports evaluator training data
+with source image, candidate image, true instruction, distractor instructions, component scores, and
+winner/loser preferences. The learned evaluator is the next stage after the exported labels are
+validated.
 
 ## Why This Is Different From The Earlier Hybrid Solver
 
 The earlier hybrid solver used one weighted scalar score. That is useful as a baseline, but it allows compensation: a strong score on one component can hide failure on another.
 
-The delta-ranker path uses:
+The delta-grounded path uses:
 
 - hard instruction and preservation gates
 - multiple candidates for the same instruction
 - relative ranking among feasible candidates
 - counterfactual instruction discrimination
+- Qwen internal prompt-gain scoring for internal-only proposals
 - evaluator disagreement filtering
 
 ## Evaluator Logic
@@ -47,6 +53,11 @@ The evaluator first applies hard gates:
 - preservation gate: did non-target content remain stable?
 
 Candidates that fail either gate are rejected before ranking.
+
+For proxy-verifiable edits, the instruction gate uses explicit image statistics such as luminance,
+saturation, contrast, or warmth. For internal-only edits such as background blur or subject emphasis,
+the instruction gate uses Qwen hidden-state prompt gain; if the internal score is unavailable, the
+candidate is rejected rather than accepted by a proxy metric.
 
 Among feasible candidates, the evaluator ranks by:
 
@@ -87,7 +98,7 @@ outputs/self_evolve/<run>/round_01/summary.json
 
 `evaluator_preferences.jsonl` contains winner-loser pairs from each candidate group.
 
-These files are the bridge from the current heuristic evaluator to a learned evaluator LoRA.
+These files are the bridge from the current heuristic evaluator to a learned evaluator head or LoRA.
 
 ## Commands
 
@@ -100,14 +111,14 @@ bash scripts/self_evolve_pillow_delta_ranker.sh --limit 8
 Qwen-backed run:
 
 ```bash
-bash scripts/self_evolve_2509_delta_ranker.sh --limit 32
+bash scripts/self_evolve_2509_delta_grounded.sh --limit 32
 ```
 
 Matrix runner:
 
 ```bash
 bash scripts/run_self_evolve_matrix.sh \
-  --variant delta-ranker \
+  --variant delta-grounded \
   --images-dir data/unlabeled/self_evolve \
   --limit 32
 ```
@@ -119,17 +130,19 @@ The minimum ablation set is:
 - base Qwen editor, no self-evolve
 - plain proxy self-training
 - weighted hybrid reward
+- old proxy-only delta ranker
+- delta-grounded ranker with structured proposer and Qwen internal prompt-gain checks
 - spatial-only evaluator
 - cycle-only evaluator
 - internal-only evaluator
-- delta-ranker without counterfactual score
-- delta-ranker without relative group score
-- delta-ranker with `K=1` versus `K=4`
+- delta-grounded without counterfactual score
+- delta-grounded without relative group score
+- delta-grounded with `K=1` versus `K=4`
 
 The critical comparison is:
 
 ```text
-weighted scalar reward vs hard gates + group-relative ranking
+weighted scalar reward vs hard gates + group-relative ranking + internal Qwen delta signals
 ```
 
 That comparison tests the main research claim.

@@ -1,6 +1,10 @@
 # Self-Evolving Loop
 
-This module is the first implementation of the project’s main research idea: a proposer-editor-solver loop that generates pseudo-labeled editing data from unlabeled images and accepts only high-scoring edits into the next training pool.
+This module is the first implementation of the project’s main research idea: a proposer-editor-evaluator loop that generates pseudo-labeled editing data from unlabeled images and accepts only high-scoring edits into the next training pool.
+
+Older code and configs may still use the name `solver` for this third component. In the image
+editing project, that component is not a solver agent; it is a fixed reward evaluator that scores
+whether a candidate image satisfies the edit instruction while preserving non-target content.
 
 ## What is implemented
 
@@ -8,7 +12,7 @@ This module is the first implementation of the project’s main research idea: a
 - difficulty shaping over proposal families
 - proposal generation
 - editor backends
-- solver backends
+- reward evaluator backends
 - accepted-sample manifest writing for downstream LoRA training
 - optional training launch after each round
 
@@ -20,17 +24,24 @@ The code lives under [src/qwen_edit_project/self_evolve](/Users/ritesh.thawkar/R
 
 - `scripted`
 - `internal_qwen` placeholder
+- `trainable_qwen_vl`
 
 ### Editor
 
 - `qwen_edit`
 - `pillow_demo`
 
-### Solver
+### Reward Evaluator
 
 - `stat`
 - `internal_qwen`
 - `hybrid`
+- `evolmm_style`
+- `hard_gated_relative`
+- `internal_cepr`
+
+The preferred config name is `evaluator:`. Existing `solver:` configs remain supported as an alias
+so old experiment commands keep working.
 
 ## Important limitation
 
@@ -38,10 +49,11 @@ The control loop is implemented, but the public `Qwen-Image-Edit` pipeline does 
 
 - the current real editor is `qwen_edit`
 - the current implemented proposer is `scripted`
-- the current baseline solver is `stat`
-- the current exploratory research solvers are `internal_qwen` and `hybrid`
+- the current baseline evaluator is `stat`
+- the current generic self-reward baseline is `evolmm_style`
+- the current exploratory research evaluators are `internal_qwen`, `hybrid`, and `hard_gated_relative`
 
-This means the repo now contains the full loop infrastructure and iterative data-generation logic, but the fully closed internal proposer-solver path is still behind an adapter boundary rather than fully realized with public upstream APIs.
+This means the repo now contains the full loop infrastructure and iterative data-generation logic, but the fully closed internal proposer-evaluator path is still behind an adapter boundary rather than fully realized with public upstream APIs.
 
 At the same time, the public DiffSynth stack does expose the Qwen-conditioned hidden states used for edit conditioning. Our utility layer now exposes those features through [qwen_pipeline.py](/Users/ritesh.thawkar/Ritesh/neurips-project/src/qwen_edit_project/utils/qwen_pipeline.py), which gives us a concrete path toward an internal representation-based verifier in the next phase.
 
@@ -49,9 +61,9 @@ At the same time, the public DiffSynth stack does expose the Qwen-conditioned hi
 
 The repo now includes three research-facing verifier ideas that can be toggled independently:
 
-- `spatial` verification inside the `hybrid` solver
+- `spatial` verification inside the `hybrid` evaluator
   - scores changed-region support and outside-region preservation separately
-- `cycle` consistency inside the `hybrid` solver
+- `cycle` consistency inside the `hybrid` evaluator
   - applies an inverse edit when available and scores reconstruction back toward the source image
 - `internal_qwen` feature verification
   - uses hidden states from Qwen’s public image-plus-instruction understanding path as an additional score
@@ -68,9 +80,48 @@ It adds:
 - hard instruction and preservation gates
 - relative ranking among feasible candidates
 - counterfactual instruction scoring
+- internal Qwen prompt-gain checks for proposals that cannot be verified by simple image statistics
 - evaluator training data export
 
 This path is the intended bridge from heuristic self-training to a learned evaluator LoRA.
+
+## Trainable Proposer Path
+
+The trainable proposer path uses a separate Qwen-VL LoRA only during data generation. It is not
+used for final editor evaluation. At the end of each round, proposal outcomes are aggregated into
+`proposer_training.jsonl`; proposals receive the highest reward when they create useful
+medium-difficulty editor-training samples:
+
+- zero accepted candidates is treated as too hard
+- all candidates accepted is treated as probably too easy
+- high CEPR++ semantic edit, preservation, and validity scores increase proposer reward
+
+The next round can then load the proposer LoRA checkpoint and generate stronger image-grounded edit
+instructions. This gives a round-level co-training schedule:
+
+```text
+proposer_r -> editor_r -> CEPR++ evaluator -> train editor_{r+1} and proposer_{r+1}
+```
+
+Use:
+
+```bash
+bash scripts/run_self_evolve_matrix.sh \
+  --variant internal-cepr-trainable-proposer \
+  --launch-training \
+  --launch-proposer-training
+```
+
+## Generic Self-Reward Baseline
+
+The `evolmm_style` evaluator is an intentionally limited baseline for the paper story. It keeps the
+self-evolving structure and K-candidate relative ranking, but uses a generic continuous scalar
+self-reward without preservation gates, counterfactual instruction discrimination, or
+delta-grounded feasibility checks. It exists to test whether a reasoning-style self-evolution reward
+transfers directly to image editing.
+
+Expected outcome: it may select candidates that satisfy a global edit proxy, but it should be weaker
+on non-edit preservation than `delta-results`.
 
 ## Round outputs
 
@@ -78,16 +129,27 @@ Each round writes:
 
 ```text
 outputs/self_evolve/<run_name>/round_01/proposals.jsonl
+outputs/self_evolve/<run_name>/round_01/proposal_plan.jsonl
+outputs/self_evolve/<run_name>/round_01/progress.json
 outputs/self_evolve/<run_name>/round_01/train_manifest.json
 outputs/self_evolve/<run_name>/round_01/accepted/images/*.png
 outputs/self_evolve/<run_name>/round_01/summary.json
+outputs/self_evolve/<run_name>/self_evolve.log
 ```
 
-The manifest format matches the existing DiffSynth training flow:
+The manifest format matches the editor LoRA training flow:
 
 - `prompt`: accepted instruction
 - `image`: edited image
 - `edit_image`: original image
+
+`proposal_plan.jsonl` is the durable proposal source of truth for a round. `proposals.jsonl` is
+appended after each candidate group is evaluated, then rewritten canonically at round end. If a job
+is interrupted, restart the same command with the same `output.root_dir`; completed rounds are
+skipped, and in-progress rounds skip proposal groups that already have all candidate rows.
+
+`progress.json` and `self_evolve.log` are the main monitoring files. `progress.json` contains the
+current round status, candidate rows written, accepted count, acceptance rate, and elapsed time.
 
 ## Running the loop
 
@@ -109,11 +171,28 @@ Hybrid NeurIPS-oriented run with all three verifier ideas enabled:
 bash scripts/self_evolve_2509_hybrid.sh --limit 32
 ```
 
-Delta-grounded ranker run:
+Results-first delta run:
 
 ```bash
-bash scripts/self_evolve_2509_delta_ranker.sh --limit 32
+bash scripts/self_evolve_2509_delta_results.sh --limit 512
 ```
+
+EvoLMM-style generic self-reward baseline:
+
+```bash
+bash scripts/self_evolve_2509_evolmm_style.sh --limit 512
+```
+
+Broader delta-grounded ranker run:
+
+```bash
+bash scripts/self_evolve_2509_delta_grounded.sh --limit 32
+```
+
+The older `self_evolve_2509_delta_ranker.sh` script is kept as a proxy-ranker ablation. The
+`delta-results` config is the default path for producing benchmark numbers quickly because it keeps
+training labels high precision. The broader `delta-grounded` config keeps the expanded structured
+taxonomy for research data generation.
 
 Single-method ablations:
 
@@ -155,7 +234,16 @@ To launch LoRA after each round, set:
 ```yaml
 training:
   trigger: launch
-  base_train_config: configs/train/lora_2509.yaml
+  base_train_config: configs/train/lora_2509_diffusers.yaml
+  resume_from_latest: true
+  trained_checkpoint_backend: official_diffusers
 ```
 
-The loop will write a round-specific training command and then promote the latest produced LoRA checkpoint into the next round if one is found.
+The loop will write a round-specific training command and then promote the latest produced LoRA
+checkpoint into the next round if one is found. For Diffusers-native editor LoRA training, existing
+`checkpoint-*` directories inside the round training output automatically add
+`--resume_from_checkpoint latest` when `training.resume_from_latest: true`.
+
+For trainable-proposer runs, `proposer.training.resume_from_latest: true` does the same for the
+Qwen-VL proposer LoRA trainer. The final benchmark/evaluation model remains the editor LoRA, not the
+proposer LoRA.

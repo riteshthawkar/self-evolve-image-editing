@@ -21,8 +21,112 @@ def _append_flag(command: list[str], flag: str, value: Any) -> None:
     command.extend([flag, str(value)])
 
 
+def _build_diffusers_train_command(config: dict[str, Any]) -> tuple[list[str], Path]:
+    runtime = config["runtime"]
+    mode = config["mode"]
+    if mode != "lora":
+        raise ValueError(f"Diffusers-native Qwen edit training only supports LoRA mode, got: {mode}")
+
+    working_dir = resolve_path(runtime.get("working_dir", "."))
+    if working_dir is None:
+        raise ValueError("runtime.working_dir is required")
+    train_script = resolve_path(runtime.get("train_script", "src/qwen_edit_project/train/diffusers_qwen_edit_lora.py"))
+    if train_script is None:
+        raise ValueError("runtime.train_script could not be resolved")
+
+    command = [runtime.get("accelerate_executable", "accelerate"), "launch"]
+    accelerate_config = runtime.get("accelerate_config_file")
+    if accelerate_config:
+        accelerate_config_path = Path(accelerate_config)
+        if not accelerate_config_path.is_absolute():
+            accelerate_config_path = working_dir / accelerate_config_path
+        command.extend(["--config_file", str(accelerate_config_path)])
+    command.append(str(train_script))
+
+    dataset = config["dataset"]
+    model = config["model"]
+    training = config["training"]
+    output = config["output"]
+    lora = config["lora"]
+
+    _append_flag(command, "--pretrained_model_name_or_path", model["pretrained_model_name_or_path"])
+    _append_flag(command, "--revision", model.get("revision"))
+    _append_flag(command, "--variant", model.get("variant"))
+    _append_flag(command, "--local_files_only", model.get("local_files_only", False))
+
+    _append_flag(command, "--dataset_base_path", resolve_path(dataset["dataset_base_path"]))
+    _append_flag(command, "--dataset_metadata_path", resolve_path(dataset["dataset_metadata_path"]))
+    _append_flag(command, "--image_key", dataset.get("image_key", "image"))
+    _append_flag(command, "--condition_image_key", dataset.get("condition_image_key", "edit_image"))
+    _append_flag(command, "--prompt_key", dataset.get("prompt_key", "prompt"))
+    _append_flag(command, "--dataset_repeat", dataset.get("dataset_repeat"))
+    _append_flag(command, "--dataloader_num_workers", dataset.get("dataset_num_workers"))
+    _append_flag(command, "--resolution", training.get("resolution"))
+    _append_flag(command, "--condition_resolution", training.get("condition_resolution"))
+    _append_flag(command, "--max_pixels", training.get("max_pixels"))
+    _append_flag(command, "--condition_pixels", training.get("condition_pixels"))
+    _append_flag(command, "--preserve_aspect_ratio", training.get("preserve_aspect_ratio", False))
+
+    _append_flag(command, "--train_batch_size", training.get("train_batch_size"))
+    _append_flag(command, "--num_train_epochs", training.get("num_epochs"))
+    _append_flag(command, "--max_train_steps", training.get("max_train_steps"))
+    _append_flag(command, "--checkpointing_steps", training.get("checkpointing_steps"))
+    _append_flag(command, "--checkpoints_total_limit", training.get("checkpoints_total_limit"))
+    _append_flag(command, "--resume_from_checkpoint", training.get("resume_from_checkpoint"))
+    _append_flag(command, "--gradient_accumulation_steps", training.get("gradient_accumulation_steps"))
+    _append_flag(command, "--gradient_checkpointing", training.get("use_gradient_checkpointing", False))
+    _append_flag(command, "--learning_rate", training.get("learning_rate"))
+    _append_flag(command, "--scale_lr", training.get("scale_lr", False))
+    _append_flag(command, "--lr_scheduler", training.get("lr_scheduler"))
+    _append_flag(command, "--lr_warmup_steps", training.get("lr_warmup_steps"))
+    _append_flag(command, "--lr_num_cycles", training.get("lr_num_cycles"))
+    _append_flag(command, "--lr_power", training.get("lr_power"))
+    _append_flag(command, "--weighting_scheme", training.get("weighting_scheme"))
+    _append_flag(command, "--logit_mean", training.get("logit_mean"))
+    _append_flag(command, "--logit_std", training.get("logit_std"))
+    _append_flag(command, "--mode_scale", training.get("mode_scale"))
+    _append_flag(command, "--max_sequence_length", training.get("max_sequence_length"))
+    _append_flag(command, "--scheduler_shift", training.get("scheduler_shift"))
+    _append_flag(command, "--guidance_scale", training.get("guidance_scale"))
+    _append_flag(command, "--allow_tf32", training.get("allow_tf32", False))
+    _append_flag(command, "--mixed_precision", training.get("mixed_precision"))
+    _append_flag(command, "--offload", training.get("offload", False))
+    _append_flag(command, "--optimizer", training.get("optimizer"))
+    _append_flag(command, "--use_8bit_adam", training.get("use_8bit_adam", False))
+    _append_flag(command, "--adam_beta1", training.get("adam_beta1"))
+    _append_flag(command, "--adam_beta2", training.get("adam_beta2"))
+    _append_flag(command, "--adam_weight_decay", training.get("adam_weight_decay"))
+    _append_flag(command, "--adam_epsilon", training.get("adam_epsilon"))
+    _append_flag(command, "--max_grad_norm", training.get("max_grad_norm"))
+    _append_flag(command, "--report_to", training.get("report_to"))
+    _append_flag(command, "--seed", training.get("seed"))
+    _append_flag(command, "--upcast_before_saving", training.get("upcast_before_saving", False))
+
+    _append_flag(command, "--rank", lora.get("lora_rank", lora.get("rank")))
+    _append_flag(command, "--lora_alpha", lora.get("lora_alpha", lora.get("alpha")))
+    _append_flag(command, "--lora_dropout", lora.get("lora_dropout", lora.get("dropout")))
+    _append_flag(command, "--lora_layers", lora.get("lora_target_modules", lora.get("target_modules")))
+    _append_flag(command, "--lora_checkpoint", lora.get("lora_checkpoint") or lora.get("checkpoint_path"))
+
+    _append_flag(command, "--output_dir", resolve_path(output["output_path"]))
+    _append_flag(command, "--logging_dir", output.get("logging_dir", "logs"))
+
+    if config.get("resume", {}).get("enabled"):
+        for value in config["resume"].get("extra_args", []):
+            command.append(str(value))
+
+    for value in config.get("extra_args", []):
+        command.append(str(value))
+
+    return command, working_dir
+
+
 def build_train_command(config: dict[str, Any]) -> tuple[list[str], Path]:
     runtime = config["runtime"]
+    backend = str(runtime.get("backend", runtime.get("training_backend", "diffsynth")))
+    if backend in {"diffusers", "official_diffusers", "diffusers_native"}:
+        return _build_diffusers_train_command(config)
+
     mode = config["mode"]
     working_dir = resolve_path(runtime["working_dir"])
     if working_dir is None:
@@ -135,4 +239,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

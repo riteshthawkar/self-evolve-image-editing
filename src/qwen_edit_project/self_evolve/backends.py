@@ -8,6 +8,12 @@ from typing import Any
 
 from PIL import Image, ImageEnhance, ImageOps
 
+from qwen_edit_project.self_evolve.edit_schema import (
+    extract_json_object,
+    normalize_structured_edit,
+    proposal_definition_from_structured_edit,
+    structured_edit_prompt,
+)
 from qwen_edit_project.self_evolve.image_metrics import (
     changed_fraction,
     diff_region_statistics,
@@ -216,6 +222,204 @@ class InternalQwenProposer:
         )
 
 
+class TrainableQwenVLProposer:
+    """Round-updatable Qwen-VL proposer with a scripted bootstrap fallback.
+
+    The proposer emits a structured edit JSON object. The loop trains this proposer through a
+    separate LoRA checkpoint at round boundaries; the final editor evaluation never uses this
+    proposer checkpoint.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        self.model_name_or_path = str(config.get("model_name_or_path", "Qwen/Qwen2.5-VL-7B-Instruct"))
+        self.checkpoint_path = config.get("checkpoint_path")
+        self.device = config.get("device", "auto")
+        self.torch_dtype = config.get("torch_dtype", "auto")
+        self.local_files_only = bool(config.get("local_files_only", False))
+        self.generation = dict(config.get("generation", {}))
+        self.fallback_on_error = bool(config.get("fallback_on_error", True))
+        self.scripted_probability = float(config.get("scripted_probability", 0.25))
+        fallback_config = dict(config.get("scripted_fallback", {}))
+        fallback_config.setdefault("families", config.get("families"))
+        fallback_config.setdefault("operation_ids", config.get("operation_ids"))
+        fallback_config.setdefault("family_policy", config.get("family_policy", "metadata_preferred"))
+        self.scripted = ScriptedProposer(fallback_config)
+        self.processor = None
+        self.model = None
+
+    def set_checkpoint_path(self, checkpoint_path: str | None) -> None:
+        if checkpoint_path == self.checkpoint_path:
+            return
+        self.checkpoint_path = checkpoint_path
+        self.model = None
+        self.processor = None
+
+    def model_state(self) -> dict[str, Any]:
+        return {
+            "backend": "trainable_qwen_vl",
+            "model_name_or_path": self.model_name_or_path,
+            "checkpoint_path": self.checkpoint_path,
+        }
+
+    @staticmethod
+    def _resolve_device(device: str):
+        import torch
+
+        if device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(device)
+
+    def _ensure_model(self):
+        if self.model is not None and self.processor is not None:
+            return self.model, self.processor
+        import torch
+
+        from qwen_edit_project.utils.device import resolve_torch_dtype
+
+        try:
+            from transformers import AutoModelForImageTextToText
+        except ImportError:
+            try:
+                from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
+            except ImportError:
+                from transformers import AutoModelForCausalLM as AutoModelForImageTextToText
+        from transformers import AutoProcessor
+
+        dtype = resolve_torch_dtype(torch, self.torch_dtype, self._resolve_device(self.device))
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_name_or_path,
+            trust_remote_code=True,
+            local_files_only=self.local_files_only,
+        )
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            self.model_name_or_path,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            local_files_only=self.local_files_only,
+        )
+        if self.checkpoint_path:
+            from peft import PeftModel
+
+            self.model = PeftModel.from_pretrained(self.model, self.checkpoint_path)
+        self.model.to(self._resolve_device(self.device))
+        self.model.eval()
+        return self.model, self.processor
+
+    def _messages(self, record: UnlabeledImageRecord, difficulty_level: int, proposals_per_image: int) -> list[dict[str, Any]]:
+        metadata_hint = ""
+        if record.caption:
+            metadata_hint += f"\nImage caption: {record.caption}"
+        if record.metadata:
+            keys = ["primary_family", "edit_families", "objects", "scene", "style"]
+            parts = [f"{key}: {record.metadata[key]}" for key in keys if key in record.metadata]
+            if parts:
+                metadata_hint += "\nMetadata: " + "; ".join(parts)
+        prompt = structured_edit_prompt(difficulty_level, proposals_per_image) + metadata_hint
+        return [
+            {
+                "role": "system",
+                "content": "You are a research proposer for image-editing self-training.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": str(record.image_path)},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
+
+    @staticmethod
+    def _to_payloads(decoded: str) -> list[dict[str, Any]]:
+        parsed = extract_json_object(decoded)
+        if parsed is None:
+            return []
+        proposals = parsed.get("proposals")
+        if isinstance(proposals, list):
+            return [item for item in proposals if isinstance(item, dict)]
+        return [parsed]
+
+    def _generate_payloads(
+        self,
+        record: UnlabeledImageRecord,
+        difficulty_level: int,
+        proposals_per_image: int,
+    ) -> list[dict[str, Any]]:
+        import torch
+
+        model, processor = self._ensure_model()
+        messages = self._messages(record, difficulty_level, proposals_per_image)
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        with Image.open(record.image_path) as image_handle:
+            image = image_handle.convert("RGB")
+        inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt")
+        inputs = {key: value.to(model.device) for key, value in inputs.items()}
+        max_new_tokens = int(self.generation.get("max_new_tokens", 512))
+        temperature = float(self.generation.get("temperature", 0.7))
+        top_p = float(self.generation.get("top_p", 0.9))
+        do_sample = bool(self.generation.get("do_sample", temperature > 0.0))
+        with torch.no_grad():
+            generation_kwargs = {
+                **inputs,
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+            }
+            if do_sample:
+                generation_kwargs["temperature"] = temperature
+                generation_kwargs["top_p"] = top_p
+            output_ids = model.generate(**generation_kwargs)
+        generated = output_ids[:, inputs["input_ids"].shape[1] :]
+        decoded = processor.batch_decode(generated, skip_special_tokens=True)[0]
+        return self._to_payloads(decoded)
+
+    def propose(
+        self,
+        record: UnlabeledImageRecord,
+        round_index: int,
+        difficulty_level: int,
+        proposals_per_image: int,
+        seed: int,
+    ) -> list[EditProposal]:
+        rng = random.Random(seed + round_index * 100_003 + sum(ord(char) for char in record.key))
+        if self.scripted_probability > 0 and rng.random() < self.scripted_probability:
+            return self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
+        try:
+            payloads = self._generate_payloads(record, difficulty_level, proposals_per_image)
+        except Exception:
+            if not self.fallback_on_error:
+                raise
+            return self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
+
+        proposals: list[EditProposal] = []
+        for index, payload in enumerate(payloads[:proposals_per_image]):
+            instruction = str(payload.get("instruction", "")).strip()
+            if not instruction:
+                continue
+            structured_edit = normalize_structured_edit(payload, instruction=instruction)
+            definition = proposal_definition_from_structured_edit(
+                structured_edit,
+                proposal_index=index,
+                difficulty_level=difficulty_level,
+            )
+            proposals.append(
+                EditProposal(
+                    record_key=record.key,
+                    round_index=round_index,
+                    proposal_index=index,
+                    definition=definition,
+                    difficulty_level=difficulty_level,
+                    instruction=definition.instruction,
+                    structured_edit=structured_edit,
+                )
+            )
+        if proposals:
+            return proposals
+        if not self.fallback_on_error:
+            return []
+        return self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
+
+
 class PillowPrototypeEditor:
     def edit_image(self, image: Image.Image, instruction: str, operation_id: str | None = None) -> Image.Image:
         if operation_id is None:
@@ -251,6 +455,49 @@ class QwenEditEditor:
             return
         self.current_checkpoint_path = checkpoint_path
         self.pipeline = None
+
+    def set_model_checkpoint(
+        self,
+        checkpoint_path: str | None,
+        *,
+        model_type: str | None = None,
+        backend: str | None = None,
+    ) -> None:
+        """Switch the editor to a checkpoint with an explicitly compatible loader.
+
+        Self-evolve training currently writes checkpoints through DiffSynth. Reloading
+        those weights through the official Diffusers base pipeline is not a valid
+        research comparison unless the checkpoint is known to be Diffusers-compatible.
+        This helper updates the checkpoint, model type, and backend as one atomic
+        editor state transition so later rounds cannot accidentally mix them.
+        """
+        model_cfg = self.config["model"]
+        old_state = (
+            self.current_checkpoint_path,
+            model_cfg.get("model_type", "base"),
+            model_cfg.get("backend", "diffsynth"),
+        )
+        if model_type is not None:
+            model_cfg["model_type"] = model_type
+        if backend is not None:
+            model_cfg["backend"] = backend
+        self.current_checkpoint_path = checkpoint_path
+        new_state = (
+            self.current_checkpoint_path,
+            model_cfg.get("model_type", "base"),
+            model_cfg.get("backend", "diffsynth"),
+        )
+        if new_state != old_state:
+            self.pipeline = None
+
+    def model_state(self) -> dict[str, Any]:
+        model_cfg = self.config.get("model", {})
+        return {
+            "backend": model_cfg.get("backend", "diffsynth"),
+            "model_type": model_cfg.get("model_type", "base"),
+            "checkpoint_path": self.current_checkpoint_path,
+            "base_model": model_cfg.get("base_model"),
+        }
 
     def _ensure_pipeline(self):
         if self.pipeline is not None:
@@ -1104,6 +1351,13 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
         self.latent_preservation_temperature = float(config.get("latent_preservation_temperature", 0.12))
         self.max_total_latent_delta = float(config.get("max_total_latent_delta", 0.45))
         self.latent_drift_temperature = float(config.get("latent_drift_temperature", 0.15))
+        self.taxonomy_enabled = bool(config.get("taxonomy_enabled", True))
+        self.taxonomy_required = bool(config.get("taxonomy_required", False))
+        self.taxonomy_threshold = float(config.get("taxonomy_threshold", 0.40))
+        self.taxonomy_temperature = float(config.get("taxonomy_temperature", 0.06))
+        self.taxonomy_source_drop_temperature = float(config.get("taxonomy_source_drop_temperature", 0.06))
+        self.taxonomy_distractor_temperature = float(config.get("taxonomy_distractor_temperature", 0.05))
+        self.max_dynamic_distractors = int(config.get("max_dynamic_distractors", 4))
         self.empty_cache_per_candidate = bool(config.get("empty_cache_per_candidate", True))
         self.retry_cpu_on_oom = bool(config.get("retry_cpu_on_oom", True))
 
@@ -1120,7 +1374,7 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
 
     def _get_internal_pipe(self, editor: Any | None) -> Any:
         if not isinstance(editor, QwenEditEditor):
-            raise ValueError("internal_cepr requires QwenEditEditor so rewards are computed from the editor itself.")
+            raise ValueError("internal_cepr requires QwenEditEditor so rewards can use Qwen internal features.")
         return editor._ensure_pipeline()
 
     def _cached_text_feature(self, pipe: Any, prompt: str, cache: dict[tuple[str, str], Any]):
@@ -1178,6 +1432,177 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
         original_similarity = self._cosine_similarity(original_feature, text_feature)
         edited_similarity = self._cosine_similarity(edited_feature, text_feature)
         return edited_similarity - original_similarity
+
+    @staticmethod
+    def _join_terms(*values: Any) -> str:
+        terms = [str(value).strip() for value in values if value not in (None, "", [])]
+        return " ".join(terms).strip()
+
+    def _taxonomy_prompt_bundle(self, proposal: EditProposal) -> dict[str, Any]:
+        spec = normalize_structured_edit(
+            proposal.structured_edit,
+            instruction=proposal.instruction,
+            family=proposal.definition.family,
+        )
+        if not proposal.structured_edit:
+            return {"supported": False, "spec": spec}
+
+        edit_type = str(spec.get("edit_type", "local_enhancement"))
+        source_object = spec.get("source_object")
+        target_object = spec.get("target_object")
+        source_attribute = spec.get("source_attribute") or spec.get("source_material") or spec.get("source_style")
+        target_attribute = spec.get("target_attribute") or spec.get("target_material") or spec.get("target_style")
+        target_location = spec.get("target_location")
+        target_region = spec.get("target_region", "target region")
+
+        main_prompts = [spec.get("instruction", proposal.instruction), proposal.instruction]
+        target_prompts: list[str] = []
+        source_drop_prompts: list[str] = []
+        wrong_prompts: list[str] = []
+
+        if edit_type == "object_replacement":
+            if target_object:
+                target_prompts.append(f"{target_region} contains {target_object}")
+                main_prompts.append(f"{source_object or 'the original object'} is replaced by {target_object}")
+            if source_object:
+                source_drop_prompts.append(f"{target_region} still contains {source_object}")
+                wrong_prompts.append(f"{source_object} is still present and unchanged")
+            for wrong in ("a dog", "a chair", "a car", "a plant"):
+                if target_object and wrong.lower() not in str(target_object).lower():
+                    wrong_prompts.append(f"{source_object or 'the object'} is replaced by {wrong}")
+        elif edit_type == "object_removal":
+            if source_object:
+                source_drop_prompts.append(f"{target_region} contains {source_object}")
+                main_prompts.append(f"{source_object} has been removed from {target_region}")
+            target_prompts.append(f"{target_region} is cleanly filled after object removal")
+        elif edit_type == "object_addition":
+            if target_object:
+                target_prompts.append(f"{target_object} has been added to {target_region}")
+                main_prompts.append(f"{target_region} now contains {target_object}")
+            wrong_prompts.append(f"nothing new has been added to {target_region}")
+        elif edit_type == "spatial_move":
+            moved = source_object or "the target object"
+            if target_location:
+                target_prompts.append(f"{moved} is {target_location}")
+                main_prompts.append(f"{moved} has moved to {target_location}")
+            if spec.get("source_location"):
+                source_drop_prompts.append(f"{moved} remains {spec['source_location']}")
+            wrong_prompts.extend([f"{moved} stays in its original position", f"{moved} is in the wrong location"])
+        elif edit_type in {"attribute_change", "color_change", "material_change", "style_transfer"}:
+            target = self._join_terms(target_attribute, target_object or source_object)
+            source = self._join_terms(source_attribute, source_object)
+            if target:
+                target_prompts.append(f"{target_region} has {target}")
+                main_prompts.append(f"{source_object or 'the target'} is changed to {target}")
+            if source:
+                source_drop_prompts.append(f"{target_region} still has {source}")
+            if target_attribute:
+                wrong_prompts.append(f"{target_region} does not have {target_attribute}")
+        elif edit_type == "background_change":
+            if target_attribute or target_object:
+                target_prompts.append(f"background changed to {self._join_terms(target_attribute, target_object)}")
+            source_drop_prompts.append("the background is unchanged")
+        else:
+            target_prompts.append(proposal.instruction)
+
+        preserve_prompts = [
+            f"unrelated content is preserved: {item}"
+            for item in spec.get("preserve", [])[: self.max_dynamic_distractors]
+        ]
+        unique = lambda items: list(dict.fromkeys(item for item in items if item))
+        return {
+            "supported": True,
+            "spec": spec,
+            "main_prompts": unique(main_prompts),
+            "target_prompts": unique(target_prompts),
+            "source_drop_prompts": unique(source_drop_prompts),
+            "wrong_prompts": unique(wrong_prompts)[: self.max_dynamic_distractors],
+            "preserve_prompts": unique(preserve_prompts),
+        }
+
+    @staticmethod
+    def _geometric_mean(values: list[float], default: float = 1.0) -> float:
+        filtered = [_clamp(value) for value in values if math.isfinite(float(value))]
+        if not filtered:
+            return default
+        product = 1.0
+        for value in filtered:
+            product *= max(value, 1e-6)
+        return _clamp(product ** (1.0 / len(filtered)))
+
+    def _taxonomy_score(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, dict[str, float]]:
+        if not self.taxonomy_enabled:
+            return 1.0, {"cepr_taxonomy_supported": 0.0, "cepr_taxonomy_score": 1.0}
+
+        bundle = self._taxonomy_prompt_bundle(proposal)
+        if not bundle.get("supported"):
+            neutral = 0.0 if self.taxonomy_required else 1.0
+            return neutral, {
+                "cepr_taxonomy_supported": 0.0,
+                "cepr_taxonomy_score": neutral,
+                "cepr_taxonomy_required": 1.0 if self.taxonomy_required else 0.0,
+            }
+
+        main_gains = [
+            self._prompt_gain_cached(pipe, prompt, original, edited, candidate_index, cache)
+            for prompt in bundle.get("main_prompts", [])
+        ]
+        target_gains = [
+            self._prompt_gain_cached(pipe, prompt, original, edited, candidate_index, cache)
+            for prompt in bundle.get("target_prompts", [])
+        ]
+        source_drops = [
+            -self._prompt_gain_cached(pipe, prompt, original, edited, candidate_index, cache)
+            for prompt in bundle.get("source_drop_prompts", [])
+        ]
+        wrong_gains = [
+            self._prompt_gain_cached(pipe, prompt, original, edited, candidate_index, cache)
+            for prompt in bundle.get("wrong_prompts", [])
+        ]
+
+        main_gain = statistics.mean(main_gains) if main_gains else 0.0
+        target_gain = statistics.mean(target_gains) if target_gains else main_gain
+        source_drop = statistics.mean(source_drops) if source_drops else 0.0
+        max_wrong_gain = max(wrong_gains) if wrong_gains else 0.0
+        contrastive_margin = main_gain - max_wrong_gain
+
+        main_score = _sigmoid(main_gain / max(self.taxonomy_temperature, 1e-6))
+        target_score = _sigmoid(target_gain / max(self.taxonomy_temperature, 1e-6))
+        contrastive_score = (
+            _sigmoid(contrastive_margin / max(self.taxonomy_distractor_temperature, 1e-6))
+            if wrong_gains
+            else 1.0
+        )
+        components = [main_score, target_score, contrastive_score]
+        if source_drops:
+            source_drop_score = _sigmoid(source_drop / max(self.taxonomy_source_drop_temperature, 1e-6))
+            components.append(source_drop_score)
+        else:
+            source_drop_score = 1.0
+
+        taxonomy_score = self._geometric_mean(components)
+        return taxonomy_score, {
+            "cepr_taxonomy_supported": 1.0,
+            "cepr_taxonomy_score": taxonomy_score,
+            "cepr_taxonomy_required": 1.0 if self.taxonomy_required else 0.0,
+            "cepr_taxonomy_main_gain": main_gain,
+            "cepr_taxonomy_target_gain": target_gain,
+            "cepr_taxonomy_source_drop": source_drop,
+            "cepr_taxonomy_max_wrong_gain": max_wrong_gain,
+            "cepr_taxonomy_contrastive_margin": contrastive_margin,
+            "cepr_taxonomy_main_score": main_score,
+            "cepr_taxonomy_target_score": target_score,
+            "cepr_taxonomy_source_drop_score": source_drop_score,
+            "cepr_taxonomy_contrastive_score": contrastive_score,
+        }
 
     def _edit_specificity(
         self,
@@ -1320,6 +1745,8 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
             accepted=False,
             component_scores={
                 "cepr_edit_specificity": 0.0,
+                "cepr_taxonomy": 0.0,
+                "cepr_semantic_edit": 0.0,
                 "cepr_preservation": 0.0,
                 "cepr_validity": 0.0,
                 "cepr_reward": 0.0,
@@ -1331,6 +1758,8 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
         return {
             "candidate_index": candidate_index,
             "edit_specificity": 0.0,
+            "taxonomy_score": 0.0,
+            "semantic_edit": 0.0,
             "preservation": 0.0,
             "validity": 0.0,
             "reward": 0.0,
@@ -1359,12 +1788,27 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
             edit_specificity, edit_signals = self._edit_specificity(
                 pipe, proposal, original, edited, candidate_index, cache
             )
+            taxonomy_score, taxonomy_signals = self._taxonomy_score(
+                pipe, proposal, original, edited, candidate_index, cache
+            )
             preservation, validity, preservation_signals = self._preservation_and_validity(
                 pipe, proposal, original, edited, candidate_index, cache
             )
-            reward = math.sqrt(max(edit_specificity * preservation, 0.0))
+            semantic_edit = (
+                math.sqrt(max(edit_specificity * taxonomy_score, 0.0))
+                if taxonomy_signals.get("cepr_taxonomy_supported", 0.0) > 0.0 or self.taxonomy_required
+                else edit_specificity
+            )
+            reward = math.sqrt(max(semantic_edit * preservation, 0.0))
             feasible = (
                 edit_specificity >= self.edit_threshold
+                and (
+                    taxonomy_score >= self.taxonomy_threshold
+                    or (
+                        taxonomy_signals.get("cepr_taxonomy_supported", 0.0) <= 0.0
+                        and not self.taxonomy_required
+                    )
+                )
                 and preservation >= self.preservation_threshold
                 and validity >= self.validity_threshold
                 and reward >= self.reward_threshold
@@ -1372,6 +1816,8 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
             return {
                 "candidate_index": candidate_index,
                 "edit_specificity": edit_specificity,
+                "taxonomy_score": taxonomy_score,
+                "semantic_edit": semantic_edit,
                 "preservation": preservation,
                 "validity": validity,
                 "reward": reward if feasible else 0.0,
@@ -1379,6 +1825,7 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
                 "feasible": feasible,
                 "signals": {
                     **edit_signals,
+                    **taxonomy_signals,
                     **preservation_signals,
                     "cepr_internal_supported": 1.0,
                     "cepr_scoring_device": scoring_device,
@@ -1461,6 +1908,8 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
             )
             component_scores = {
                 "cepr_edit_specificity": row["edit_specificity"],
+                "cepr_taxonomy": row["taxonomy_score"],
+                "cepr_semantic_edit": row["semantic_edit"],
                 "cepr_preservation": row["preservation"],
                 "cepr_validity": row["validity"],
                 "cepr_raw_reward": row["raw_reward"],
@@ -1485,6 +1934,8 @@ def build_proposer(config: dict[str, Any]):
         return ScriptedProposer(config)
     if backend == "internal_qwen":
         return InternalQwenProposer()
+    if backend in {"trainable_qwen_vl", "qwen_vl_lora"}:
+        return TrainableQwenVLProposer(config)
     raise ValueError(f"Unsupported proposer backend: {backend}")
 
 
@@ -1497,36 +1948,41 @@ def build_editor(config: dict[str, Any]):
     raise ValueError(f"Unsupported editor backend: {backend}")
 
 
-def build_solver(config: dict[str, Any]):
+def build_evaluator(config: dict[str, Any]):
     backend = config.get("backend", "stat")
     if backend == "stat":
         return StatSolver(config)
     if backend == "internal_qwen":
-        solver_config = dict(config)
-        solver_config.setdefault("proxy_weight", 0.7)
-        solver_config.setdefault("internal_weight", 0.3)
-        return MultiSignalSolver(solver_config)
+        evaluator_config = dict(config)
+        evaluator_config.setdefault("proxy_weight", 0.7)
+        evaluator_config.setdefault("internal_weight", 0.3)
+        return MultiSignalSolver(evaluator_config)
     if backend == "hybrid":
         return MultiSignalSolver(config)
     if backend in {"generic_relative_self_reward", "evolmm_style"}:
-        solver_config = dict(config)
-        solver_config.setdefault("global_weight", 1.0)
-        solver_config.setdefault("local_weight", 0.0)
-        solver_config.setdefault("proxy_weight", 1.0)
-        solver_config.setdefault("spatial_weight", 0.0)
-        solver_config.setdefault("cycle_weight", 0.0)
-        solver_config.setdefault("internal_weight", 0.0)
-        return GenericRelativeSelfRewardEvaluator(solver_config)
+        evaluator_config = dict(config)
+        evaluator_config.setdefault("global_weight", 1.0)
+        evaluator_config.setdefault("local_weight", 0.0)
+        evaluator_config.setdefault("proxy_weight", 1.0)
+        evaluator_config.setdefault("spatial_weight", 0.0)
+        evaluator_config.setdefault("cycle_weight", 0.0)
+        evaluator_config.setdefault("internal_weight", 0.0)
+        return GenericRelativeSelfRewardEvaluator(evaluator_config)
     if backend in {"hard_gated_relative", "delta_ranker"}:
-        solver_config = dict(config)
-        solver_config.setdefault("spatial_weight", 0.20)
-        solver_config.setdefault("cycle_weight", 0.0)
-        solver_config.setdefault("internal_weight", 0.0)
-        return HardGatedRelativeEvaluator(solver_config)
+        evaluator_config = dict(config)
+        evaluator_config.setdefault("spatial_weight", 0.20)
+        evaluator_config.setdefault("cycle_weight", 0.0)
+        evaluator_config.setdefault("internal_weight", 0.0)
+        return HardGatedRelativeEvaluator(evaluator_config)
     if backend in {"internal_cepr", "contrastive_edit_preservation"}:
-        solver_config = dict(config)
-        solver_config.setdefault("counterfactual_backend", "internal")
-        solver_config.setdefault("counterfactual_distractors", 4)
-        solver_config.setdefault("top_m", 1)
-        return InternalContrastiveEditPreservationEvaluator(solver_config)
-    raise ValueError(f"Unsupported solver backend: {backend}")
+        evaluator_config = dict(config)
+        evaluator_config.setdefault("counterfactual_backend", "internal")
+        evaluator_config.setdefault("counterfactual_distractors", 4)
+        evaluator_config.setdefault("top_m", 1)
+        return InternalContrastiveEditPreservationEvaluator(evaluator_config)
+    raise ValueError(f"Unsupported evaluator backend: {backend}")
+
+
+def build_solver(config: dict[str, Any]):
+    """Backward-compatible name for historical configs and scripts."""
+    return build_evaluator(config)

@@ -40,7 +40,7 @@ The selected manifest can be consumed directly by self-evolve:
 
 ```bash
 bash scripts/run_self_evolve_matrix.sh \
-  --variant delta-ranker \
+  --variant delta-results \
   --set dataset.source=jsonl \
   --set dataset.manifest_jsonl=data/unlabeled/selected/manifest.jsonl \
   --limit 128

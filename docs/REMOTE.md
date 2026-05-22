@@ -16,6 +16,9 @@ sbatch scripts/slurm/01_prepare_data.sbatch
 sbatch scripts/slurm/02_self_evolve_delta_ranker.sbatch
 ```
 
+The self-evolve Slurm script name is historical; it now launches the `delta-results` variant by
+default.
+
 The detailed data workflow is in [REMOTE_DATA_PIPELINE.md](/Users/ritesh.thawkar/Ritesh/neurips-project/docs/REMOTE_DATA_PIPELINE.md).
 
 Useful env vars:

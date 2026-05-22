@@ -62,6 +62,13 @@ bash scripts/run_edit_model_suite.sh --model-type lora --train --dry-run --limit
 bash scripts/run_edit_model_suite.sh --model-type lora --train --resume --dry-run --limit 2
 bash scripts/run_edit_model_suite.sh --model-type full --train --resume --dry-run --resume-arg --resume_from_checkpoint --resume-arg outputs/checkpoints/Qwen-Image-Edit-2509_full/dry_run_checkpoint.safetensors --limit 2
 bash scripts/run_edit_model_suite.sh --model-type full --train --dry-run --limit 2
+bash scripts/train_lora_2509_diffusers.sh \
+  --dry-run \
+  --set dataset.dataset_base_path=. \
+  --set dataset.dataset_metadata_path="$TMP_OUTPUT/diffusers_train_manifest.json" \
+  --set output.output_path="$TMP_OUTPUT/diffusers_lora" \
+  --set output.command_file="$TMP_OUTPUT/diffusers_train_command.txt" \
+  --set output.log_dir="$TMP_OUTPUT/diffusers_logs"
 
 echo "[4/6] Dry-run generation suite commands"
 bash scripts/run_generation_sanity_suite.sh --dry-run --limit 2
@@ -113,6 +120,27 @@ bash scripts/run_self_evolve_matrix.sh \
   --images-dir "$TMP_IMAGES" \
   --checkpoint "$TMP_IMAGES/sample_1.png" \
   --editor-model-type lora \
+  --output-prefix "$TMP_OUTPUT/self_evolve_dry_run"
+
+bash scripts/run_self_evolve_matrix.sh \
+  --variant evolmm-style \
+  --dry-run \
+  --limit 2 \
+  --images-dir "$TMP_IMAGES" \
+  --output-prefix "$TMP_OUTPUT/self_evolve_dry_run"
+
+bash scripts/run_self_evolve_matrix.sh \
+  --variant delta-grounded \
+  --dry-run \
+  --limit 2 \
+  --images-dir "$TMP_IMAGES" \
+  --output-prefix "$TMP_OUTPUT/self_evolve_dry_run"
+
+bash scripts/run_self_evolve_matrix.sh \
+  --variant delta-results \
+  --dry-run \
+  --limit 2 \
+  --images-dir "$TMP_IMAGES" \
   --output-prefix "$TMP_OUTPUT/self_evolve_dry_run"
 
 bash scripts/run_self_evolve_matrix.sh \

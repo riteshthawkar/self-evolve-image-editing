@@ -15,6 +15,8 @@ from qwen_edit_project.utils.paths import ensure_dir, resolve_path
 
 CEPR_COMPONENTS = [
     "cepr_edit_specificity",
+    "cepr_taxonomy",
+    "cepr_semantic_edit",
     "cepr_preservation",
     "cepr_validity",
     "cepr_raw_reward",
@@ -27,6 +29,15 @@ CEPR_SIGNALS = [
     "cepr_contrastive_margin",
     "cepr_contrastive_score",
     "cepr_absolute_edit_score",
+    "cepr_taxonomy_score",
+    "cepr_taxonomy_main_gain",
+    "cepr_taxonomy_target_gain",
+    "cepr_taxonomy_source_drop",
+    "cepr_taxonomy_contrastive_margin",
+    "cepr_taxonomy_main_score",
+    "cepr_taxonomy_target_score",
+    "cepr_taxonomy_source_drop_score",
+    "cepr_taxonomy_contrastive_score",
     "cepr_semantic_preservation_score",
     "cepr_semantic_preservation_cosine",
     "cepr_latent_outside_preservation",
@@ -58,11 +69,15 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def evaluation_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return row.get("evaluator") or row.get("solver", {})
+
+
 def numeric_values(rows: list[dict[str, Any]], key: str, source: str) -> list[float]:
     values = []
     for row in rows:
-        solver = row.get("solver", {})
-        container = solver.get(source, {})
+        evaluator = evaluation_payload(row)
+        container = evaluator.get(source, {})
         value = container.get(key)
         if isinstance(value, (int, float)) and math.isfinite(float(value)):
             values.append(float(value))
@@ -111,11 +126,11 @@ def describe(values: list[float]) -> dict[str, float | int | None]:
 
 
 def row_score(row: dict[str, Any], component: str, signal: str | None = None) -> float:
-    solver = row.get("solver", {})
+    evaluator = evaluation_payload(row)
     if signal is not None:
-        value = solver.get("signals", {}).get(signal, 0.0)
+        value = evaluator.get("signals", {}).get(signal, 0.0)
     else:
-        value = solver.get("component_scores", {}).get(component, 0.0)
+        value = evaluator.get("component_scores", {}).get(component, 0.0)
     return float(value) if isinstance(value, (int, float)) and math.isfinite(float(value)) else 0.0
 
 
@@ -167,9 +182,9 @@ def component_correlations(rows: list[dict[str, Any]]) -> dict[str, dict[str, fl
         source = "component_scores" if key in CEPR_COMPONENTS else "signals"
         pairs: list[tuple[float, float]] = []
         for row in rows:
-            solver = row.get("solver", {})
-            target_value = solver.get("component_scores", {}).get("cepr_raw_reward")
-            value = solver.get(source, {}).get(key)
+            evaluator = evaluation_payload(row)
+            target_value = evaluator.get("component_scores", {}).get("cepr_raw_reward")
+            value = evaluator.get(source, {}).get(key)
             if (
                 isinstance(target_value, (int, float))
                 and isinstance(value, (int, float))
@@ -206,7 +221,7 @@ def summarize(rows: list[dict[str, Any]], thresholds: dict[str, float]) -> dict[
         proposal = row.get("proposal", {})
         operations[str(proposal.get("operation_id", "unknown"))] += 1
         families[str(proposal.get("family", "unknown"))] += 1
-        signals = row.get("solver", {}).get("signals", {})
+        signals = evaluation_payload(row).get("signals", {})
         error_type = signals.get("cepr_candidate_runtime_error_type")
         if error_type:
             runtime_errors[str(error_type)] += 1
@@ -291,9 +306,9 @@ def write_component_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
         writer.writeheader()
         for row in rows:
             proposal = row.get("proposal", {})
-            solver = row.get("solver", {})
-            component_scores = solver.get("component_scores", {})
-            signals = solver.get("signals", {})
+            evaluator = evaluation_payload(row)
+            component_scores = evaluator.get("component_scores", {})
+            signals = evaluator.get("signals", {})
             writer.writerow(
                 {
                     "group_id": row.get("group_id"),

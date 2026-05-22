@@ -90,7 +90,8 @@ bash scripts/self_evolve_2509_hybrid.sh --limit 32
 bash scripts/run_edit_model_suite.sh --model-type lora --train --limit 64
 bash scripts/run_generation_sanity_suite.sh --limit 32
 bash scripts/run_self_evolve_matrix.sh --variant all --limit 32 --images-dir data/unlabeled/self_evolve
-bash scripts/run_self_evolve_matrix.sh --variant delta-ranker --limit 32 --images-dir data/unlabeled/self_evolve
+bash scripts/run_self_evolve_matrix.sh --variant evolmm-style --limit 512 --images-dir data/unlabeled/self_evolve
+bash scripts/run_self_evolve_matrix.sh --variant delta-results --limit 512 --images-dir data/unlabeled/self_evolve
 bash scripts/run_pipeline_smoke_tests.sh
 ```
 

@@ -41,12 +41,15 @@ def main() -> None:
         "height": validation.get("height"),
         "negative_prompt": validation.get("negative_prompt", " "),
     }
+    model = config["model"]
     pipe = load_qwen_edit_pipeline(
-        model_id_with_origin_paths=config["model"]["model_id_with_origin_paths"],
+        model_id_with_origin_paths=model["model_id_with_origin_paths"],
         checkpoint_path=args.checkpoint,
         model_type=args.mode,
         device=args.device,
-        torch_dtype=config["model"].get("torch_dtype", "auto"),
+        torch_dtype=model.get("torch_dtype", "auto"),
+        backend=model.get("backend", "diffsynth"),
+        base_model=model.get("pretrained_model_name_or_path") or model.get("base_model"),
     )
     output = render_edit(pipe, prompt, [Path(item) for item in edit_images if item is not None], generation)
     image = output.images[0] if hasattr(output, "images") else output

@@ -1,4 +1,4 @@
-name: self_evolve_qwen_edit_2509_internal_cepr
+name: self_evolve_qwen_edit_2509_internal_cepr_trainable_proposer
 runtime:
   seed: 123
   dry_run: false
@@ -8,17 +8,52 @@ dataset:
   metadata_jsonl: null
   limit: null
 proposer:
-  backend: scripted
+  backend: trainable_qwen_vl
+  model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+  checkpoint_path: null
+  device: auto
+  torch_dtype: bfloat16
+  local_files_only: false
+  fallback_on_error: false
+  # Keep a small scripted mixture early so the proposer cannot collapse before it has rewards.
+  scripted_probability: 0.20
   family_policy: metadata_preferred
-  families:
-    - exposure
-    - color
-    - contrast
-    - tone
-    - style
-    - background
-    - local
-    - detail
+  generation:
+    max_new_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    do_sample: true
+  training:
+    # Use "launch" on the remote GPU machine. "emit_only" writes the exact command and data.
+    trigger: emit_only
+    train_script: src/qwen_edit_project/train/train_proposer_lora.py
+    accelerate_executable: accelerate
+    output_dir: null
+    command_file: null
+    log_dir: null
+    mixed_precision: bf16
+    learning_rate: 1.0e-5
+    num_train_epochs: 1
+    max_train_steps: null
+    train_batch_size: 1
+    gradient_accumulation_steps: 4
+    max_grad_norm: 1.0
+    weight_decay: 0.01
+    seed: 123
+    lora_rank: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_target_modules: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    gradient_checkpointing: true
+    checkpointing_steps: 100
+    checkpoints_total_limit: 5
+    resume_from_latest: true
+    logging_steps: 10
+    data:
+      reward_center: 0.50
+      reward_sigma: 0.25
+      min_reward: 0.35
+      min_quality: 0.30
 editor:
   backend: qwen_edit
   device: auto
@@ -42,14 +77,14 @@ editor:
 candidate_generation:
   samples_per_proposal: 4
   seed_stride: 7919
-solver:
+evaluator:
   backend: internal_cepr
   top_m: 1
   counterfactual_distractors: 4
-  edit_threshold: 0.53
-  preservation_threshold: 0.60
-  validity_threshold: 0.35
-  reward_threshold: 0.52
+  edit_threshold: 0.45
+  preservation_threshold: 0.20
+  validity_threshold: 0.50
+  reward_threshold: 0.30
   edit_temperature: 0.04
   true_gain_temperature: 0.04
   min_true_gain: 0.0
@@ -57,20 +92,27 @@ solver:
   latent_resolution: 512
   latent_mask_std_scale: 0.75
   latent_mask_min_delta: 0.03
-  latent_preservation_temperature: 0.12
+  latent_preservation_temperature: 0.30
   max_total_latent_delta: 0.45
   latent_drift_temperature: 0.15
+  taxonomy_enabled: true
+  taxonomy_required: true
+  taxonomy_threshold: 0.40
+  taxonomy_temperature: 0.06
+  taxonomy_source_drop_temperature: 0.06
+  taxonomy_distractor_temperature: 0.05
+  max_dynamic_distractors: 4
   empty_cache_per_candidate: true
   retry_cpu_on_oom: true
   require_internal_components: true
 curriculum:
-  num_rounds: 2
+  num_rounds: 3
   proposals_per_image: 1
-  initial_level: 1
+  initial_level: 2
   min_level: 1
   max_level: 3
-  promote_at: 0.70
-  demote_at: 0.35
+  promote_at: 0.65
+  demote_at: 0.25
   max_records_per_round: 512
 training:
   trigger: emit_only
@@ -82,7 +124,7 @@ training:
   reconstruction_replay_ratio: 0.15
   reconstruction_replay_prompt: Reconstruct the input image exactly. Preserve all content, layout, colors, and text.
 output:
-  root_dir: outputs/self_evolve/qwen_edit_2509_internal_cepr
+  root_dir: outputs/self_evolve/qwen_edit_2509_internal_cepr_trainable_proposer
   save_all_candidates: true
   use_cumulative_manifest: true
   write_evaluator_training: true

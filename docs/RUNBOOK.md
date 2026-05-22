@@ -169,10 +169,16 @@ Combined research variant:
 bash scripts/self_evolve_2509_hybrid.sh --limit 32
 ```
 
-Delta-ranker path:
+Delta-grounded path:
 
 ```bash
-bash scripts/self_evolve_2509_delta_ranker.sh --limit 32
+bash scripts/self_evolve_2509_delta_grounded.sh --limit 32
+```
+
+Results-first path:
+
+```bash
+bash scripts/run_self_evolve_matrix.sh --variant delta-results --limit 512
 ```
 
 Single-method ablations:
@@ -186,9 +192,10 @@ bash scripts/self_evolve_2509_internal.sh --limit 32
 Candidate-group evaluator ablation:
 
 ```bash
-bash scripts/run_self_evolve_matrix.sh --variant delta-ranker --limit 32
-bash scripts/run_self_evolve_matrix.sh --variant delta-ranker --limit 32 --set solver.rank_counterfactual_weight=0.0
-bash scripts/run_self_evolve_matrix.sh --variant delta-ranker --limit 32 --set candidate_generation.samples_per_proposal=1
+bash scripts/run_self_evolve_matrix.sh --variant evolmm-style --limit 128
+bash scripts/run_self_evolve_matrix.sh --variant delta-results --limit 128
+bash scripts/run_self_evolve_matrix.sh --variant delta-results --limit 128 --set solver.rank_counterfactual_weight=0.0
+bash scripts/run_self_evolve_matrix.sh --variant delta-results --limit 128 --set candidate_generation.samples_per_proposal=1
 ```
 
 Dry run of the Qwen-backed loop:

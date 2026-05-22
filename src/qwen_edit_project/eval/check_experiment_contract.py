@@ -71,6 +71,24 @@ def check_self_evolve_config(path: str | Path, errors: list[str]) -> None:
     check_official_edit_model(f"{prefix}.editor", editor.get("model", {}), errors)
     replay_ratio = float(config.get("training", {}).get("reconstruction_replay_ratio", 0.0))
     require(replay_ratio > 0.0, f"{prefix}.training.reconstruction_replay_ratio must be > 0", errors)
+    training = config.get("training", {})
+    require_equal(
+        training.get("continue_with_trained_checkpoint"),
+        True,
+        f"{prefix}.training.continue_with_trained_checkpoint",
+        errors,
+    )
+    expected_checkpoint_backend = (
+        "official_diffusers"
+        if str(training.get("base_train_config", "")).endswith("lora_2509_diffusers.yaml")
+        else "diffsynth"
+    )
+    require_equal(
+        training.get("trained_checkpoint_backend"),
+        expected_checkpoint_backend,
+        f"{prefix}.training.trained_checkpoint_backend",
+        errors,
+    )
 
 
 def check_train_config(path: str | Path, errors: list[str]) -> None:
@@ -86,6 +104,38 @@ def check_train_config(path: str | Path, errors: list[str]) -> None:
     require_equal(config.get("training", {}).get("width"), None, f"{prefix}.training.width", errors)
 
 
+def check_diffusers_train_config(path: str | Path, errors: list[str]) -> None:
+    config = load_yaml_config(path)
+    prefix = _format_path(path)
+    require_equal(config.get("runtime", {}).get("backend"), "diffusers", f"{prefix}.runtime.backend", errors)
+    require_equal(
+        config.get("model", {}).get("pretrained_model_name_or_path"),
+        EXPECTED_BASE_MODEL,
+        f"{prefix}.model.pretrained_model_name_or_path",
+        errors,
+    )
+    require_equal(
+        config.get("model", {}).get("backend"),
+        "official_diffusers",
+        f"{prefix}.model.backend",
+        errors,
+    )
+    dataset = config.get("dataset", {})
+    require_equal(dataset.get("image_key"), "image", f"{prefix}.dataset.image_key", errors)
+    require_equal(dataset.get("condition_image_key"), "edit_image", f"{prefix}.dataset.condition_image_key", errors)
+    require_equal(dataset.get("prompt_key"), "prompt", f"{prefix}.dataset.prompt_key", errors)
+    training = config.get("training", {})
+    require_equal(training.get("preserve_aspect_ratio"), True, f"{prefix}.training.preserve_aspect_ratio", errors)
+    require_equal(training.get("train_batch_size"), 1, f"{prefix}.training.train_batch_size", errors)
+    require(training.get("checkpointing_steps") is not None, f"{prefix}.training.checkpointing_steps is required", errors)
+    require_equal(
+        config.get("output", {}).get("checkpoint_backend"),
+        "official_diffusers",
+        f"{prefix}.output.checkpoint_backend",
+        errors,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate that experiment configs follow the Qwen paper-matched contract.")
     parser.add_argument("--self-evolve-glob", default="configs/self_evolve/qwen_edit_2509*.yaml")
@@ -96,6 +146,7 @@ def main() -> None:
     check_eval_config("configs/eval/imgedit.yaml", errors)
     check_train_config("configs/train/lora_2509.yaml", errors)
     check_train_config("configs/train/full_2509.yaml", errors)
+    check_diffusers_train_config("configs/train/lora_2509_diffusers.yaml", errors)
 
     repo_root = resolve_path(".")
     if repo_root is None:

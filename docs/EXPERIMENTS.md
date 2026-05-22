@@ -20,6 +20,7 @@ This does not require the real benchmark assets or the full GPU environment. It 
 - shell syntax
 - dry-run command composition for train and eval suites
 - a lightweight `pillow-hybrid` self-evolve run on temporary images
+- dry-run command composition for the generic self-reward and delta-ranker self-evolve variants
 
 ## Output Contract
 
@@ -288,16 +289,33 @@ bash scripts/run_self_evolve_matrix.sh \
   --limit 128
 ```
 
-### Fresh delta-ranker run
+### Fresh delta-grounded run
 
-This is the stronger research path: it samples multiple candidates per instruction, applies hard instruction and preservation gates, ranks feasible candidates, and writes evaluator training records.
+This is the stronger research path: it samples multiple candidates per instruction, applies hard
+instruction and preservation gates, uses Qwen internal prompt-gain checks for internal-only edits,
+ranks feasible candidates, and writes evaluator training records.
 
 ```bash
 bash scripts/run_self_evolve_matrix.sh \
-  --variant delta-ranker \
+  --variant delta-grounded \
   --images-dir data/unlabeled/self_evolve \
   --output-prefix outputs/self_evolve/exp01_delta \
   --limit 128
+```
+
+### Results-first delta run
+
+Use this when there is no time for pilots. It keeps the same candidate-group ranker, but trains only
+on proxy-verifiable edits and requires Qwen internal feature support as an auxiliary check. This is
+the highest-precision path for producing benchmarkable LoRA results quickly.
+
+```bash
+bash scripts/run_self_evolve_matrix.sh \
+  --variant delta-results \
+  --set dataset.source=jsonl \
+  --set dataset.manifest_jsonl=data/unlabeled/selected/manifest.jsonl \
+  --output-prefix outputs/self_evolve/results01 \
+  --limit 512
 ```
 
 ### Hybrid run starting from the latest LoRA checkpoint
@@ -318,17 +336,50 @@ Run these to isolate the new method components:
 
 ```bash
 bash scripts/run_self_evolve_matrix.sh \
-  --variant delta-ranker \
+  --variant naive-self-train \
+  --images-dir data/unlabeled/self_evolve \
+  --output-prefix outputs/self_evolve/ablate_naive \
+  --limit 128
+
+bash scripts/run_self_evolve_matrix.sh \
+  --variant evolmm-style \
+  --images-dir data/unlabeled/self_evolve \
+  --output-prefix outputs/self_evolve/ablate_evolmm_style \
+  --limit 128
+
+bash scripts/run_self_evolve_matrix.sh \
+  --variant hybrid-scalar \
+  --images-dir data/unlabeled/self_evolve \
+  --output-prefix outputs/self_evolve/ablate_hybrid_scalar \
+  --limit 128
+
+bash scripts/run_self_evolve_matrix.sh \
+  --variant delta-ranker-proxy \
+  --images-dir data/unlabeled/self_evolve \
+  --output-prefix outputs/self_evolve/ablate_proxy_ranker \
+  --limit 128
+
+bash scripts/run_self_evolve_matrix.sh \
+  --variant delta-results \
   --images-dir data/unlabeled/self_evolve \
   --output-prefix outputs/self_evolve/ablate_no_counterfactual \
   --set solver.rank_counterfactual_weight=0.0 \
   --limit 128
 
 bash scripts/run_self_evolve_matrix.sh \
-  --variant delta-ranker \
+  --variant delta-results \
   --images-dir data/unlabeled/self_evolve \
   --output-prefix outputs/self_evolve/ablate_k1 \
   --set candidate_generation.samples_per_proposal=1 \
+  --limit 128
+
+bash scripts/run_self_evolve_matrix.sh \
+  --variant delta-results \
+  --images-dir data/unlabeled/self_evolve \
+  --output-prefix outputs/self_evolve/ablate_no_internal \
+  --set solver.require_internal_when_weighted=false \
+  --set solver.internal_weight=0.0 \
+  --set solver.rank_internal_weight=0.0 \
   --limit 128
 ```
 
