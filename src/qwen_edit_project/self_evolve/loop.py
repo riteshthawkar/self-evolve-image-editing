@@ -130,6 +130,30 @@ def _resolve_num_rounds(value: Any, record_count: int, max_records_per_round: in
     return int(value)
 
 
+def _deep_update(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+EDITOR_TRAINING_OVERRIDE_KEYS = {
+    "learning_rate",
+    "num_epochs",
+    "max_train_steps",
+    "train_batch_size",
+    "gradient_accumulation_steps",
+    "checkpointing_steps",
+    "checkpoints_total_limit",
+    "resume_from_checkpoint",
+    "mixed_precision",
+    "use_8bit_adam",
+    "offload",
+}
+
+
 class SelfEvolveRunner:
     def __init__(self, config: dict[str, Any], dry_run: bool = False, limit: int | None = None):
         self.config = config
@@ -168,6 +192,17 @@ class SelfEvolveRunner:
         file_handler.setFormatter(formatter)
         logger.handlers = [stream_handler, file_handler]
         return logger
+
+    def _release_resident_models(self, reason: str) -> None:
+        released: list[str] = []
+        for name in ("editor", "proposer", "evaluator"):
+            component = getattr(self, name, None)
+            release = getattr(component, "release_memory", None)
+            if callable(release):
+                release()
+                released.append(name)
+        if released:
+            self.logger.info("Released resident model memory before %s: %s.", reason, ", ".join(released))
 
     def _candidate_payload(
         self,
@@ -685,6 +720,13 @@ class SelfEvolveRunner:
 
         editor_state_before = self.editor.model_state() if isinstance(self.editor, QwenEditEditor) else None
         train_config = load_yaml_config(base_config_path)
+        train_overrides = training_cfg.get("train_config_overrides") or training_cfg.get("editor_train_overrides")
+        if isinstance(train_overrides, dict):
+            train_config = _deep_update(train_config, train_overrides)
+        train_training_config = train_config.setdefault("training", {})
+        for key in EDITOR_TRAINING_OVERRIDE_KEYS:
+            if key in training_cfg:
+                train_training_config[key] = training_cfg[key]
         train_config["name"] = f"{train_config['name']}_self_evolve_r{round_index:02d}"
         train_config["dataset"]["dataset_base_path"] = "."
         train_config["dataset"]["dataset_metadata_path"] = relative_to_repo(manifest_path)
@@ -742,6 +784,7 @@ class SelfEvolveRunner:
                 "trained_checkpoint_backend": training_checkpoint_backend(training_cfg, train_config),
             }
 
+        self._release_resident_models("editor training subprocess")
         return_code = run_and_tee(command, cwd=working_dir, log_path=log_path)
         if return_code != 0:
             raise SystemExit(return_code)
@@ -869,6 +912,7 @@ class SelfEvolveRunner:
             }
         if trigger != "launch":
             raise ValueError(f"Unsupported proposer.training.trigger: {trigger}")
+        self._release_resident_models("proposer training subprocess")
         return_code = run_and_tee(command, cwd=resolve_path(".") or Path("."), log_path=log_path)
         if return_code != 0:
             raise SystemExit(return_code)

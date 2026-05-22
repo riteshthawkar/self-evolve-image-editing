@@ -268,6 +268,23 @@ class TrainableQwenVLProposer:
             "checkpoint_path": self.checkpoint_path,
         }
 
+    def release_memory(self) -> None:
+        if self.model is not None and hasattr(self.model, "to"):
+            try:
+                self.model.to("cpu")
+            except Exception:
+                pass
+        self.model = None
+        self.processor = None
+        try:
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            return
+
     @staticmethod
     def _resolve_device(device: str):
         import torch
@@ -511,6 +528,18 @@ class QwenEditEditor:
             "checkpoint_path": self.current_checkpoint_path,
             "base_model": model_cfg.get("base_model"),
         }
+
+    def release_memory(self) -> None:
+        if self.pipeline is not None:
+            try:
+                if hasattr(self.pipeline, "to"):
+                    self.pipeline.to("cpu")
+                for name in ("transformer", "dit", "unet", "text_encoder", "vae"):
+                    self._move_module(getattr(self.pipeline, name, None), "cpu")
+            except Exception:
+                pass
+        self.pipeline = None
+        self._empty_cuda_cache()
 
     def _ensure_pipeline(self):
         if self.pipeline is not None:
