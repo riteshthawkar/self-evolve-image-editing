@@ -112,6 +112,11 @@ instructions. This gives a round-level co-training schedule:
 proposer_r -> editor_r -> CEPR++ evaluator -> train editor_{r+1} and proposer_{r+1}
 ```
 
+Rounds can be micro-batches rather than full-dataset passes. With
+`curriculum.record_schedule=sequential_shards`, round 1 uses the first
+`curriculum.max_records_per_round` images, round 2 uses the next shard, and so on, wrapping only
+after all available records are consumed. This keeps updates frequent without per-image overfitting.
+
 Use:
 
 ```bash
@@ -150,9 +155,10 @@ outputs/self_evolve/<run_name>/self_evolve.log
 
 The manifest format matches the editor LoRA training flow:
 
-- `prompt`: accepted instruction
+- `prompt`: edit instruction
 - `image`: edited image
 - `edit_image`: original image
+- `sample_weight`: CEPR-derived SFT weight
 
 `proposal_plan.jsonl` is the durable proposal source of truth for a round. `proposals.jsonl` is
 appended after each candidate group is evaluated, then rewritten canonically at round end. If a job

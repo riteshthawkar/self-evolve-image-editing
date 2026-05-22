@@ -110,6 +110,7 @@ evaluator:
   require_internal_components: true
 curriculum:
   num_rounds: 3
+  record_schedule: sequential_shards
   proposals_per_image: 1
   initial_level: 2
   min_level: 1

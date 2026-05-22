@@ -86,6 +86,12 @@ def check_self_evolve_config(path: str | Path, errors: list[str]) -> None:
             f"{prefix}.training.weighted_sft.enabled",
             errors,
         )
+        require_equal(
+            config.get("curriculum", {}).get("record_schedule"),
+            "sequential_shards",
+            f"{prefix}.curriculum.record_schedule",
+            errors,
+        )
     editor = config.get("editor", {})
     require_equal(editor.get("backend"), "qwen_edit", f"{prefix}.editor.backend", errors)
     check_generation(f"{prefix}.editor", editor.get("generation", {}), errors)

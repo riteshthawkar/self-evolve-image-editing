@@ -227,6 +227,38 @@ class SelfEvolveRunner:
             values.sort(key=lambda row: int(row.get("candidate_index", 0)))
         return dict(grouped)
 
+    def _round_records_for_round(
+        self,
+        round_index: int,
+        max_records_per_round: int,
+    ) -> tuple[list[UnlabeledImageRecord], dict[str, Any]]:
+        if not self.records:
+            return [], {
+                "record_schedule": "empty",
+                "record_start_index": 0,
+                "record_count": 0,
+                "record_indices": [],
+                "record_wraparound": False,
+            }
+        count = min(max(1, max_records_per_round), len(self.records))
+        schedule = str(self.config.get("curriculum", {}).get("record_schedule", "sequential_shards"))
+        if schedule in {"fixed_first_slice", "first_slice", "fixed"}:
+            indices = list(range(count))
+        elif schedule in {"sequential_shards", "sequential", "sharded"}:
+            start = ((round_index - 1) * count) % len(self.records)
+            indices = [(start + offset) % len(self.records) for offset in range(count)]
+        else:
+            raise ValueError(
+                "Unsupported curriculum.record_schedule. Use 'sequential_shards' or 'fixed_first_slice'."
+            )
+        return [self.records[index] for index in indices], {
+            "record_schedule": schedule,
+            "record_start_index": indices[0] if indices else 0,
+            "record_count": len(indices),
+            "record_indices": indices,
+            "record_wraparound": bool(indices and indices[-1] < indices[0]),
+        }
+
     @staticmethod
     def _is_completed_group(rows: list[dict[str, Any]], samples_per_proposal: int) -> bool:
         if len(rows) < samples_per_proposal:
@@ -925,7 +957,7 @@ class SelfEvolveRunner:
             proposer_state_before_round = (
                 self.proposer.model_state() if hasattr(self.proposer, "model_state") else None
             )
-            round_records = self.records[:max_records_per_round]
+            round_records, round_record_info = self._round_records_for_round(round_index, max_records_per_round)
             existing_candidate_rows = read_jsonl(proposals_path) if resume_enabled else []
             candidate_payload_by_key = {
                 self._candidate_key(payload): payload
@@ -958,6 +990,7 @@ class SelfEvolveRunner:
                     "status": "running",
                     "round_index": round_index,
                     "difficulty_level": difficulty_level,
+                    **round_record_info,
                     "records_seen": 0,
                     "records_total": len(round_records),
                     "groups_completed": len(skippable_groups),
@@ -1047,6 +1080,7 @@ class SelfEvolveRunner:
                     for candidate_index in range(samples_per_proposal):
                         candidate_seed = (
                             seed
+                            + round_index * 1_000_003
                             + record_index * candidate_seed_stride
                             + proposal.proposal_index * 101
                             + candidate_index
@@ -1105,6 +1139,7 @@ class SelfEvolveRunner:
                             "status": "running",
                             "round_index": round_index,
                             "difficulty_level": difficulty_level,
+                            **round_record_info,
                             "records_seen": record_index + 1,
                             "records_total": len(round_records),
                             "groups_seen": groups_seen,
@@ -1173,6 +1208,7 @@ class SelfEvolveRunner:
                     "round_index": round_index,
                     "difficulty_level": difficulty_level,
                     "next_difficulty_level": next_level,
+                    **round_record_info,
                     "records_seen": len(round_records),
                     "records_total": len(round_records),
                     "groups_completed": len(skippable_groups),
@@ -1199,6 +1235,7 @@ class SelfEvolveRunner:
                 "round_index": round_index,
                 "difficulty_level": difficulty_level,
                 "next_difficulty_level": next_level,
+                **round_record_info,
                 "records_seen": len(round_records),
                 "proposal_groups": len(self._group_rows(candidate_payloads)),
                 "candidates": total_candidates,
@@ -1252,6 +1289,7 @@ class SelfEvolveRunner:
                     "round_index": round_index,
                     "difficulty_level": difficulty_level,
                     "next_difficulty_level": next_level,
+                    **round_record_info,
                     "records_seen": len(round_records),
                     "records_total": len(round_records),
                     "groups_completed": len(skippable_groups),
