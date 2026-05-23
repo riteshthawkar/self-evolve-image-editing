@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import gc
 import sys
 import time
 from collections import defaultdict
@@ -1142,6 +1143,8 @@ class SelfEvolveRunner:
                         else:
                             edited_image = self.editor.edit(record, proposal)
                         edited_images.append(edited_image)
+                        if isinstance(self.editor, QwenEditEditor):
+                            QwenEditEditor._empty_cuda_cache()
 
                     if hasattr(self.evaluator, "score_group"):
                         evaluation_results = self.evaluator.score_group(
@@ -1180,6 +1183,13 @@ class SelfEvolveRunner:
                         )
                         candidate_payload_by_key[self._candidate_key(payload)] = payload
                         append_jsonl(payload, proposals_path)
+
+                    del edited_images
+                    del evaluation_results
+                    del original_image
+                    gc.collect()
+                    if isinstance(self.editor, QwenEditEditor):
+                        QwenEditEditor._empty_cuda_cache()
 
                     skippable_groups.add(group_id)
                     groups_completed_this_run += 1

@@ -620,8 +620,11 @@ class QwenEditEditor:
             generation.pop("width", None)
             generation.pop("height", None)
         prompt = polish_prompt(instruction, use_prompt_polish=False, image_context=image)
-        output = render_edit(pipeline, prompt, [image.convert("RGB")], generation)
-        return output.images[0] if hasattr(output, "images") else output
+        try:
+            output = render_edit(pipeline, prompt, [image.convert("RGB")], generation)
+            return output.images[0] if hasattr(output, "images") else output
+        finally:
+            self._empty_cuda_cache()
 
     def edit(self, record: UnlabeledImageRecord, proposal: EditProposal) -> Image.Image:
         image = Image.open(record.image_path).convert("RGB")

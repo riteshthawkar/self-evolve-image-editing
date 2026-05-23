@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -484,6 +485,12 @@ def render_edit(
 ) -> Image.Image:
     conditioning = normalize_edit_inputs(edit_images)
     kwargs = build_generation_kwargs(generation)
+    try:
+        import torch
+
+        inference_context = torch.inference_mode()
+    except Exception:
+        inference_context = nullcontext()
     backend = getattr(pipe, "_qwen_edit_backend", "diffsynth")
     if backend == "official_diffusers":
         seed = kwargs.pop("seed", None)
@@ -497,10 +504,12 @@ def render_edit(
                 kwargs["generator"] = torch.Generator(device="cpu").manual_seed(int(seed))
         kwargs["image"] = conditioning
         kwargs["prompt"] = prompt
-        return pipe(**_filter_pipeline_kwargs(pipe, kwargs))
+        with inference_context:
+            return pipe(**_filter_pipeline_kwargs(pipe, kwargs))
 
     kwargs["edit_image"] = conditioning
-    return pipe(prompt, **_filter_pipeline_kwargs(pipe, kwargs))
+    with inference_context:
+        return pipe(prompt, **_filter_pipeline_kwargs(pipe, kwargs))
 
 
 def render_generation(
