@@ -1138,8 +1138,20 @@ class SelfEvolveRunner:
                     )
                     with Image.open(record.image_path) as original_image_handle:
                         original_image = original_image_handle.convert("RGB")
-                    edited_images: list[Image.Image] = []
+                    generated_image_dir = candidate_image_dir or ensure_dir(candidates_dir / "images")
+                    existing_group_rows = self._group_rows(list(candidate_payload_by_key.values())).get(group_id, [])
+                    generated_rows = {
+                        int(row.get("candidate_index", -1)): row
+                        for row in existing_group_rows
+                        if str(row.get("status")) == "generated" and row.get("edited_image_path")
+                    }
+                    edited_images_by_index: dict[int, Image.Image] = {}
                     for candidate_index in range(samples_per_proposal):
+                        generated_row = generated_rows.get(candidate_index)
+                        generated_path = resolve_path(str(generated_row.get("edited_image_path"))) if generated_row else None
+                        if generated_path is not None and generated_path.exists():
+                            edited_images_by_index[candidate_index] = Image.open(generated_path).convert("RGB")
+                            continue
                         candidate_seed = (
                             seed
                             + round_index * 1_000_003
@@ -1151,9 +1163,28 @@ class SelfEvolveRunner:
                             edited_image = self.editor.edit_candidate(record, proposal, candidate_index, candidate_seed)
                         else:
                             edited_image = self.editor.edit(record, proposal)
-                        edited_images.append(edited_image)
+                        output_name = (
+                            f"{record.key}__r{round_index:02d}__p{proposal.proposal_index:02d}"
+                            f"__c{candidate_index:02d}__{proposal.definition.operation_id}.png"
+                        )
+                        generated_path = generated_image_dir / output_name
+                        edited_image.save(generated_path)
+                        payload = self._candidate_payload(
+                            record,
+                            proposal,
+                            evaluation_result=None,
+                            image_path=generated_path,
+                            status="generated",
+                            candidate_index=candidate_index,
+                            group_id=group_id,
+                            distractors=distractors,
+                        )
+                        candidate_payload_by_key[self._candidate_key(payload)] = payload
+                        append_jsonl(payload, proposals_path)
+                        edited_images_by_index[candidate_index] = edited_image
                         if isinstance(self.editor, QwenEditEditor):
                             QwenEditEditor._empty_cuda_cache()
+                    edited_images = [edited_images_by_index[index] for index in range(samples_per_proposal)]
 
                     if hasattr(self.evaluator, "score_group"):
                         evaluation_results = self.evaluator.score_group(
@@ -1176,9 +1207,10 @@ class SelfEvolveRunner:
                         if evaluation_result.accepted:
                             image_path = accepted_dir / output_name
                             edited_image.save(image_path)
-                        elif candidate_image_dir is not None:
-                            image_path = candidate_image_dir / output_name
-                            edited_image.save(image_path)
+                        else:
+                            image_path = generated_image_dir / output_name
+                            if not image_path.exists():
+                                edited_image.save(image_path)
 
                         payload = self._candidate_payload(
                             record,

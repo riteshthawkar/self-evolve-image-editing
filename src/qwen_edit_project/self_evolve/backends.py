@@ -479,12 +479,14 @@ class QwenEditEditor:
         self.generation = dict(config.get("generation", {}))
         self.pipeline = None
         self.current_checkpoint_path = config["model"].get("checkpoint_path")
+        self.generation_modules_dropped = False
 
     def set_checkpoint_path(self, checkpoint_path: str | None) -> None:
         if checkpoint_path == self.current_checkpoint_path:
             return
         self.current_checkpoint_path = checkpoint_path
         self.pipeline = None
+        self.generation_modules_dropped = False
 
     def set_model_checkpoint(
         self,
@@ -519,6 +521,7 @@ class QwenEditEditor:
         )
         if new_state != old_state:
             self.pipeline = None
+            self.generation_modules_dropped = False
 
     def model_state(self) -> dict[str, Any]:
         model_cfg = self.config.get("model", {})
@@ -539,6 +542,7 @@ class QwenEditEditor:
             except Exception:
                 pass
         self.pipeline = None
+        self.generation_modules_dropped = False
         self._empty_cuda_cache()
 
     def _ensure_pipeline(self):
@@ -556,6 +560,7 @@ class QwenEditEditor:
             base_model=model_cfg.get("base_model"),
             local_files_only=bool(model_cfg.get("local_files_only", False)),
         )
+        self.generation_modules_dropped = False
         return self.pipeline
 
     def _resolved_torch_device(self):
@@ -583,6 +588,8 @@ class QwenEditEditor:
 
     def prepare_for_generation(self) -> None:
         """Ensure heavyweight generation modules are on the target device."""
+        if self.generation_modules_dropped:
+            self.release_memory()
         pipeline = self._ensure_pipeline()
         device = self._resolved_torch_device()
         if hasattr(pipeline, "to"):
@@ -597,14 +604,23 @@ class QwenEditEditor:
         Qwen-Image-Edit generation fits on a large H200, but it leaves almost no free
         memory for extra internal text/VAE reward passes. CEPR scoring only needs the
         editor's text/understanding path and VAE latents, not the diffusion transformer,
-        so we temporarily offload the transformer/DiT to CPU.
+        so we drop generation-only modules and reload them before the next generation.
         """
         pipeline = self._ensure_pipeline()
-        if hasattr(pipeline, "to"):
-            pipeline.to("cpu")
-        self._empty_cuda_cache()
+        # CEPR scoring only needs the text/understanding path and VAE. Moving the
+        # full diffusion transformer to CPU can exceed host RAM on long runs, so
+        # drop generation-only modules and reload them before the next generation.
         for name in ("transformer", "dit", "unet"):
-            self._move_module(getattr(pipeline, name, None), "cpu")
+            module = getattr(pipeline, name, None)
+            if module is not None:
+                try:
+                    setattr(pipeline, name, None)
+                except Exception:
+                    self._move_module(module, "cpu")
+                else:
+                    self.generation_modules_dropped = True
+                del module
+        self._empty_cuda_cache()
         device = scoring_device or self._resolved_torch_device()
         for name in ("text_encoder", "vae"):
             self._move_module(getattr(pipeline, name, None), device)
