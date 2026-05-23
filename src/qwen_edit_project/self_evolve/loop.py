@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import gc
+import os
 import sys
 import time
 from collections import defaultdict
@@ -43,6 +44,8 @@ def write_jsonl(items: list[dict[str, Any]], path: Path) -> Path:
     with path.open("w", encoding="utf-8") as handle:
         for item in items:
             handle.write(json.dumps(item, ensure_ascii=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     return path
 
 
@@ -51,6 +54,7 @@ def append_jsonl(item: dict[str, Any], path: Path) -> Path:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(item, ensure_ascii=True) + "\n")
         handle.flush()
+        os.fsync(handle.fileno())
     return path
 
 
@@ -140,6 +144,45 @@ def _deep_update(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, A
     return base
 
 
+def _process_memory_snapshot() -> dict[str, Any]:
+    snapshot: dict[str, Any] = {"pid": os.getpid()}
+    status_path = Path("/proc/self/status")
+    if status_path.exists():
+        try:
+            for line in status_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith(("VmRSS:", "VmHWM:", "VmSize:", "VmPeak:")):
+                    key, value = line.split(":", 1)
+                    parts = value.strip().split()
+                    if parts:
+                        snapshot[f"{key.lower()}_kb"] = int(parts[0])
+        except OSError:
+            pass
+    try:
+        import resource
+
+        snapshot["ru_maxrss_kb"] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            snapshot.update(
+                {
+                    "cuda_free_mb": round(free_bytes / (1024**2), 1),
+                    "cuda_total_mb": round(total_bytes / (1024**2), 1),
+                    "cuda_allocated_mb": round(torch.cuda.memory_allocated() / (1024**2), 1),
+                    "cuda_reserved_mb": round(torch.cuda.memory_reserved() / (1024**2), 1),
+                    "cuda_max_allocated_mb": round(torch.cuda.max_memory_allocated() / (1024**2), 1),
+                    "cuda_max_reserved_mb": round(torch.cuda.max_memory_reserved() / (1024**2), 1),
+                }
+            )
+    except Exception:
+        pass
+    return snapshot
+
+
 EDITOR_TRAINING_OVERRIDE_KEYS = {
     "learning_rate",
     "num_epochs",
@@ -211,6 +254,13 @@ class SelfEvolveRunner:
         if callable(release):
             release()
             self.logger.info("Released %s model memory before %s.", component_name, reason)
+
+    def _log_memory(self, event: str, **details: Any) -> None:
+        runtime_cfg = self.config.get("runtime", {})
+        if not bool(runtime_cfg.get("memory_log_enabled", True)):
+            return
+        payload = {"event": event, **details, **_process_memory_snapshot()}
+        self.logger.info("MEMORY %s", json.dumps(payload, ensure_ascii=True, sort_keys=True))
 
     def _candidate_payload(
         self,
@@ -973,6 +1023,7 @@ class SelfEvolveRunner:
             samples_per_proposal,
             resume_enabled,
         )
+        self._log_memory("run_started", rounds=num_rounds, records=len(self.records))
         cumulative_accepted: list[AcceptedSample] = []
         cumulative_training_records: list[dict[str, Any]] = []
 
@@ -1100,8 +1151,6 @@ class SelfEvolveRunner:
                         proposal_plan_rows.append(plan_payload)
                         planned_groups.append((group_id, proposal))
 
-                self._release_component_model("proposer", "editor candidate generation")
-
                 for group_id, proposal in planned_groups:
                     groups_seen += 1
                     if group_id in skippable_groups:
@@ -1129,12 +1178,19 @@ class SelfEvolveRunner:
                         groups_completed_this_run += 1
                         continue
 
+                    self._release_component_model("proposer", "editor candidate generation")
                     self.logger.info(
                         "Round %02d group %s: generating %s candidate(s) for record %s.",
                         round_index,
                         group_id,
                         samples_per_proposal,
                         record.key,
+                    )
+                    self._log_memory(
+                        "before_group_generation",
+                        round_index=round_index,
+                        group_id=group_id,
+                        record_key=record.key,
                     )
                     with Image.open(record.image_path) as original_image_handle:
                         original_image = original_image_handle.convert("RGB")
@@ -1151,6 +1207,13 @@ class SelfEvolveRunner:
                         generated_path = resolve_path(str(generated_row.get("edited_image_path"))) if generated_row else None
                         if generated_path is not None and generated_path.exists():
                             edited_images_by_index[candidate_index] = Image.open(generated_path).convert("RGB")
+                            self._log_memory(
+                                "loaded_generated_candidate",
+                                round_index=round_index,
+                                group_id=group_id,
+                                candidate_index=candidate_index,
+                                image_path=str(generated_path),
+                            )
                             continue
                         candidate_seed = (
                             seed
@@ -1158,6 +1221,13 @@ class SelfEvolveRunner:
                             + record_index * candidate_seed_stride
                             + proposal.proposal_index * 101
                             + candidate_index
+                        )
+                        self._log_memory(
+                            "before_candidate_generation",
+                            round_index=round_index,
+                            group_id=group_id,
+                            candidate_index=candidate_index,
+                            seed=candidate_seed,
                         )
                         if hasattr(self.editor, "edit_candidate"):
                             edited_image = self.editor.edit_candidate(record, proposal, candidate_index, candidate_seed)
@@ -1184,8 +1254,21 @@ class SelfEvolveRunner:
                         edited_images_by_index[candidate_index] = edited_image
                         if isinstance(self.editor, QwenEditEditor):
                             QwenEditEditor._empty_cuda_cache()
+                        self._log_memory(
+                            "after_candidate_generated",
+                            round_index=round_index,
+                            group_id=group_id,
+                            candidate_index=candidate_index,
+                            image_path=str(generated_path),
+                        )
                     edited_images = [edited_images_by_index[index] for index in range(samples_per_proposal)]
 
+                    self._log_memory(
+                        "before_cepr_scoring",
+                        round_index=round_index,
+                        group_id=group_id,
+                        candidates=len(edited_images),
+                    )
                     if hasattr(self.evaluator, "score_group"):
                         evaluation_results = self.evaluator.score_group(
                             proposal, original_image, edited_images, editor=self.editor
@@ -1195,6 +1278,12 @@ class SelfEvolveRunner:
                             self.evaluator.score(proposal, original_image, edited_image, editor=self.editor)
                             for edited_image in edited_images
                         ]
+                    self._log_memory(
+                        "after_cepr_scoring",
+                        round_index=round_index,
+                        group_id=group_id,
+                        candidates=len(evaluation_results),
+                    )
 
                     for candidate_index, (edited_image, evaluation_result) in enumerate(
                         zip(edited_images, evaluation_results)

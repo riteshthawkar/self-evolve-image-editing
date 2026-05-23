@@ -322,13 +322,14 @@ def extract_qwen_edit_understanding_features(
     fallback_dtype = getattr(pipe, "torch_dtype", getattr(getattr(pipe, "text_encoder", None), "dtype", None))
     device, dtype = _module_device_and_dtype(getattr(pipe, "text_encoder", None), fallback_device, fallback_dtype)
     model_inputs = pipe.processor(text=[text], images=processor_input, padding=True, return_tensors="pt").to(device)
-    outputs = pipe.text_encoder(
-        input_ids=model_inputs.input_ids,
-        attention_mask=model_inputs.attention_mask,
-        pixel_values=model_inputs.pixel_values,
-        image_grid_thw=model_inputs.image_grid_thw,
-        output_hidden_states=True,
-    )
+    with torch.inference_mode():
+        outputs = pipe.text_encoder(
+            input_ids=model_inputs.input_ids,
+            attention_mask=model_inputs.attention_mask,
+            pixel_values=model_inputs.pixel_values,
+            image_grid_thw=model_inputs.image_grid_thw,
+            output_hidden_states=True,
+        )
     hidden_states = outputs.hidden_states[-1] if hasattr(outputs, "hidden_states") else outputs[-1]
     if isinstance(hidden_states, (tuple, list)):
         hidden_states = hidden_states[-1]
@@ -341,11 +342,14 @@ def extract_qwen_edit_understanding_features(
     else:
         token_embeddings = token_embeddings.to(device=device)
         pooled_embedding = pooled_embedding.to(device=device)
+    token_embeddings = token_embeddings.detach()
+    attention_mask = attention_mask.detach()
+    pooled_embedding = pooled_embedding.detach()
     return {
         "token_embeddings": token_embeddings,
         "attention_mask": attention_mask,
         "pooled_embedding": pooled_embedding,
-        "raw_hidden_states": trimmed_states,
+        "raw_hidden_states": [state.detach() for state in trimmed_states],
         "image_count": len(image_list),
         "prompt": prompt,
     }
@@ -368,11 +372,12 @@ def extract_qwen_text_features(
     fallback_dtype = getattr(pipe, "torch_dtype", getattr(getattr(pipe, "text_encoder", None), "dtype", None))
     device, dtype = _module_device_and_dtype(getattr(pipe, "text_encoder", None), fallback_device, fallback_dtype)
     model_inputs = tokenizer([text], padding=True, return_tensors="pt").to(device)
-    outputs = pipe.text_encoder(
-        input_ids=model_inputs.input_ids,
-        attention_mask=model_inputs.attention_mask,
-        output_hidden_states=True,
-    )
+    with torch.inference_mode():
+        outputs = pipe.text_encoder(
+            input_ids=model_inputs.input_ids,
+            attention_mask=model_inputs.attention_mask,
+            output_hidden_states=True,
+        )
     hidden_states = outputs.hidden_states[-1] if hasattr(outputs, "hidden_states") else outputs[-1]
     if isinstance(hidden_states, (tuple, list)):
         hidden_states = hidden_states[-1]
@@ -385,11 +390,14 @@ def extract_qwen_text_features(
     else:
         token_embeddings = token_embeddings.to(device=device)
         pooled_embedding = pooled_embedding.to(device=device)
+    token_embeddings = token_embeddings.detach()
+    attention_mask = attention_mask.detach()
+    pooled_embedding = pooled_embedding.detach()
     return {
         "token_embeddings": token_embeddings,
         "attention_mask": attention_mask,
         "pooled_embedding": pooled_embedding,
-        "raw_hidden_states": trimmed_states,
+        "raw_hidden_states": [state.detach() for state in trimmed_states],
         "prompt": prompt,
     }
 
@@ -474,7 +482,7 @@ def extract_qwen_vae_latents(
     scaling_factor = getattr(getattr(vae, "config", None), "scaling_factor", None)
     if scaling_factor is not None:
         latents = latents * scaling_factor
-    return latents.float()
+    return latents.float().detach()
 
 
 def render_edit(

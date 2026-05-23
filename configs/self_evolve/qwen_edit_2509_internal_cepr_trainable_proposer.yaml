@@ -2,6 +2,7 @@ name: self_evolve_qwen_edit_2509_internal_cepr_trainable_proposer
 runtime:
   seed: 123
   dry_run: false
+  memory_log_enabled: true
 dataset:
   source: directory
   images_dir: data/unlabeled/self_evolve
