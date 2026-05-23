@@ -1391,7 +1391,17 @@ class SelfEvolveRunner:
                 for name, value in sample.evaluation_result.component_scores.items():
                     component_score_totals.setdefault(name, []).append(value)
             total_candidates = len(candidate_payloads)
-            acceptance_rate = (len(accepted) / total_candidates) if total_candidates else 0.0
+            grouped_payloads = self._group_rows(candidate_payloads)
+            total_groups = len(grouped_payloads)
+            accepted_groups = sum(
+                1 for rows in grouped_payloads.values() if any(row.get("status") == "accepted" for row in rows)
+            )
+            candidate_acceptance_rate = (len(accepted) / total_candidates) if total_candidates else 0.0
+            group_acceptance_rate = (accepted_groups / total_groups) if total_groups else 0.0
+            # Difficulty should track solved edit tasks, not accepted candidate images.
+            # With top_m=1 and K candidates, candidate acceptance is capped at 1/K
+            # even if every proposal has a valid edit.
+            acceptance_rate = group_acceptance_rate
             next_level = self.difficulty_controller.update(acceptance_rate)
             self._write_progress(
                 progress_path,
@@ -1407,7 +1417,10 @@ class SelfEvolveRunner:
                     "groups_total_estimate": len(round_records) * proposals_per_image,
                     "candidate_rows_written": total_candidates,
                     "accepted": len(accepted),
+                    "accepted_groups": accepted_groups,
                     "acceptance_rate": acceptance_rate,
+                    "group_acceptance_rate": group_acceptance_rate,
+                    "candidate_acceptance_rate": candidate_acceptance_rate,
                     "train_manifest_samples": train_manifest_sample_count,
                     "train_manifest_weight_sum": train_manifest_weight_sum,
                     "elapsed_seconds": round(time.time() - round_started_at, 3),
@@ -1429,15 +1442,18 @@ class SelfEvolveRunner:
                 "next_difficulty_level": next_level,
                 **round_record_info,
                 "records_seen": len(round_records),
-                "proposal_groups": len(self._group_rows(candidate_payloads)),
+                "proposal_groups": total_groups,
                 "candidates": total_candidates,
                 "accepted": len(accepted),
+                "accepted_groups": accepted_groups,
                 "cumulative_accepted": len(cumulative_accepted),
                 "round_training_samples": len(round_training_records),
                 "round_training_weight_sum": training_weight_summary["weight_sum"],
                 "train_manifest_samples": train_manifest_sample_count,
                 "train_manifest_weight_sum": train_manifest_weight_sum,
                 "acceptance_rate": acceptance_rate,
+                "group_acceptance_rate": group_acceptance_rate,
+                "candidate_acceptance_rate": candidate_acceptance_rate,
                 "avg_total_score": (sum(accepted_scores) / len(accepted_scores)) if accepted_scores else 0.0,
                 "avg_global_score": (sum(global_scores) / len(global_scores)) if global_scores else 0.0,
                 "avg_local_score": (sum(local_scores) / len(local_scores)) if local_scores else 0.0,
@@ -1488,7 +1504,10 @@ class SelfEvolveRunner:
                     "groups_total_estimate": len(round_records) * proposals_per_image,
                     "candidate_rows_written": total_candidates,
                     "accepted": len(accepted),
+                    "accepted_groups": accepted_groups,
                     "acceptance_rate": acceptance_rate,
+                    "group_acceptance_rate": group_acceptance_rate,
+                    "candidate_acceptance_rate": candidate_acceptance_rate,
                     "train_manifest_samples": train_manifest_sample_count,
                     "train_manifest_weight_sum": train_manifest_weight_sum,
                     "elapsed_seconds": round(time.time() - round_started_at, 3),
@@ -1499,11 +1518,15 @@ class SelfEvolveRunner:
             )
             overall_summary["rounds"].append(round_summary)
             self.logger.info(
-                "Round %02d completed: candidates=%s accepted=%s acceptance_rate=%.4f next_difficulty=%s elapsed=%.1fs.",
+                "Round %02d completed: groups=%s accepted_groups=%s candidates=%s accepted=%s "
+                "group_acceptance_rate=%.4f candidate_acceptance_rate=%.4f next_difficulty=%s elapsed=%.1fs.",
                 round_index,
+                total_groups,
+                accepted_groups,
                 total_candidates,
                 len(accepted),
-                acceptance_rate,
+                group_acceptance_rate,
+                candidate_acceptance_rate,
                 next_level,
                 time.time() - round_started_at,
             )
