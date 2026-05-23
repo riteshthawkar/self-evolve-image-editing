@@ -205,6 +205,13 @@ class SelfEvolveRunner:
         if released:
             self.logger.info("Released resident model memory before %s: %s.", reason, ", ".join(released))
 
+    def _release_component_model(self, component_name: str, reason: str) -> None:
+        component = getattr(self, component_name, None)
+        release = getattr(component, "release_memory", None)
+        if callable(release):
+            release()
+            self.logger.info("Released %s model memory before %s.", component_name, reason)
+
     def _candidate_payload(
         self,
         record: UnlabeledImageRecord,
@@ -1092,6 +1099,8 @@ class SelfEvolveRunner:
                         append_jsonl(plan_payload, proposal_plan_path)
                         proposal_plan_rows.append(plan_payload)
                         planned_groups.append((group_id, proposal))
+
+                self._release_component_model("proposer", "editor candidate generation")
 
                 for group_id, proposal in planned_groups:
                     groups_seen += 1
