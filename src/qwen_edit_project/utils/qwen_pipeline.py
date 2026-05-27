@@ -520,6 +520,63 @@ def render_edit(
         return pipe(prompt, **_filter_pipeline_kwargs(pipe, kwargs))
 
 
+def render_edit_batch(
+    pipe: Any,
+    prompts: list[str],
+    edit_images: list[list[Path | Image.Image]],
+    generation: dict[str, Any],
+) -> list[Image.Image]:
+    if len(prompts) != len(edit_images):
+        raise ValueError("prompts and edit_images must have the same batch size")
+    if not prompts:
+        return []
+
+    backend = getattr(pipe, "_qwen_edit_backend", "diffsynth")
+    if backend != "official_diffusers" or len(prompts) == 1:
+        outputs = []
+        for prompt, images in zip(prompts, edit_images):
+            output = render_edit(pipe, prompt, images, generation)
+            outputs.append(output.images[0] if hasattr(output, "images") else output)
+        return outputs
+
+    conditioning = [normalize_edit_inputs(images) for images in edit_images]
+    if any(isinstance(item, list) for item in conditioning):
+        raise ValueError("Batched official Diffusers edit export expects one conditioning image per prompt")
+
+    kwargs = build_generation_kwargs(generation)
+    if int(kwargs.get("num_images_per_prompt", 1)) != 1:
+        raise ValueError("Batched edit export currently requires num_images_per_prompt=1")
+
+    try:
+        import torch
+
+        inference_context = torch.inference_mode()
+    except Exception:
+        torch = None
+        inference_context = nullcontext()
+
+    seed = kwargs.pop("seed", None)
+    if seed is not None and "generator" not in kwargs and torch is not None:
+        device = getattr(pipe, "_execution_device", getattr(pipe, "device", "cpu"))
+        generators = []
+        for _ in prompts:
+            try:
+                generators.append(torch.Generator(device=device).manual_seed(int(seed)))
+            except RuntimeError:
+                generators.append(torch.Generator(device="cpu").manual_seed(int(seed)))
+        kwargs["generator"] = generators
+
+    kwargs["image"] = conditioning
+    kwargs["prompt"] = prompts
+    with inference_context:
+        output = pipe(**_filter_pipeline_kwargs(pipe, kwargs))
+
+    images = list(output.images if hasattr(output, "images") else output)
+    if len(images) != len(prompts):
+        raise RuntimeError(f"Expected {len(prompts)} generated images, got {len(images)}")
+    return images
+
+
 def render_generation(
     pipe: Any,
     prompt: str,
