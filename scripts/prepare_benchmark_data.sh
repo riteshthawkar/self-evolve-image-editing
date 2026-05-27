@@ -141,6 +141,28 @@ find_first() {
   find "$root" "$@" -print -quit 2>/dev/null || true
 }
 
+copy_file_if_different() {
+  local source_path="$1"
+  local target_path="$2"
+  mkdir -p "$(dirname "$target_path")"
+  if [[ -e "$target_path" ]]; then
+    if "${PYTHON:-python3}" - "$source_path" "$target_path" <<'PY'
+import os
+import sys
+
+try:
+    same = os.path.samefile(sys.argv[1], sys.argv[2])
+except FileNotFoundError:
+    same = False
+sys.exit(0 if same else 1)
+PY
+    then
+      return
+    fi
+  fi
+  cp -f "$source_path" "$target_path"
+}
+
 safe_link_or_copy_dir() {
   local source_dir="$1"
   local target_dir="$2"
@@ -232,8 +254,8 @@ prepare_imgedit() {
     exit 1
   fi
 
-  cp -f "$basic_json" data/processed/benchmark/imgedit/basic_edit.json
-  cp -f "$prompts_json" third_party/imgedit/Benchmark/Basic/prompts.json
+  copy_file_if_different "$basic_json" data/processed/benchmark/imgedit/basic_edit.json
+  copy_file_if_different "$prompts_json" third_party/imgedit/Benchmark/Basic/prompts.json
   safe_link_or_copy_dir "$original_dir" data/processed/benchmark/imgedit/original_images "$IMGEDIT_MATERIALIZE"
   echo "Prepared ImgEdit Basic-Bench assets."
 }
