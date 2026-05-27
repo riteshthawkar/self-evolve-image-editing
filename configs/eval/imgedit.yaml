@@ -33,6 +33,9 @@ output:
   allow_resume_mismatch: false
 scoring:
   num_processes: 4
+  openai_model: gpt-4o
+  openai_timeout_seconds: 60
+  openai_max_retries: 2
   retry_num_processes: 1
   max_retry_rounds: 5
   retry_sleep_seconds: 10

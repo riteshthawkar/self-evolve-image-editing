@@ -61,11 +61,15 @@ def run_basic_scorer(
     num_processes: int,
     timestamp: str,
     label: str,
+    model: str,
+    timeout: float,
+    max_retries: int,
 ) -> Path:
     basic_log = resolve_path(f"outputs/logs/imgedit_score_{timestamp}_{label}.log")
     command = [
         python_executable,
-        str(resolve_path("third_party/imgedit/Benchmark/Basic/basic_bench.py")),
+        "-m",
+        "qwen_edit_project.eval.imgedit_basic_bench",
         "--result_img_folder",
         str(result_dir),
         "--edit_json",
@@ -76,6 +80,12 @@ def run_basic_scorer(
         str(num_processes),
         "--prompts_json",
         str(prompts_json_path),
+        "--model",
+        model,
+        "--timeout",
+        str(timeout),
+        "--max_retries",
+        str(max_retries),
     ]
     return_code = run_and_tee(command, cwd=repo_root, log_path=basic_log)
     if return_code != 0:
@@ -127,6 +137,9 @@ def main() -> None:
     logs = []
     results = load_json_dict(result_json)
     invalid_keys = invalid_imgedit_keys(edit_specs, results)
+    openai_model = str(config["scoring"].get("openai_model", "gpt-4o"))
+    openai_timeout = float(config["scoring"].get("openai_timeout_seconds", 60))
+    openai_max_retries = int(config["scoring"].get("openai_max_retries", 2))
     if invalid_keys and len(invalid_keys) == len(edit_specs):
         logs.append(
             str(
@@ -140,6 +153,9 @@ def main() -> None:
                     num_processes=int(config["scoring"].get("num_processes", 4)),
                     timestamp=timestamp,
                     label="initial",
+                    model=openai_model,
+                    timeout=openai_timeout,
+                    max_retries=openai_max_retries,
                 )
             )
         )
@@ -169,6 +185,9 @@ def main() -> None:
                     num_processes=max(1, retry_num_processes),
                     timestamp=timestamp,
                     label=f"retry_{retry_index:02d}",
+                    model=openai_model,
+                    timeout=openai_timeout,
+                    max_retries=openai_max_retries,
                 )
             )
         )
