@@ -76,7 +76,9 @@ hf_download() {
   local local_dir="$3"
   shift 3
   mkdir -p "$local_dir"
-  if command -v huggingface-cli >/dev/null 2>&1; then
+  if command -v hf >/dev/null 2>&1; then
+    hf download "$repo_id" --repo-type "$repo_type" --local-dir "$local_dir" "$@"
+  elif command -v huggingface-cli >/dev/null 2>&1; then
     huggingface-cli download "$repo_id" --repo-type "$repo_type" --local-dir "$local_dir" "$@"
   else
     "${PYTHON:-python3}" - "$repo_type" "$repo_id" "$local_dir" "$@" <<'PY'
