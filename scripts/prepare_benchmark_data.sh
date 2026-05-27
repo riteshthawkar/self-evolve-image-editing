@@ -106,6 +106,26 @@ PY
   fi
 }
 
+download_url() {
+  local url="$1"
+  local target="$2"
+  mkdir -p "$(dirname "$target")"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$target"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$url" -O "$target"
+  else
+    "${PYTHON:-python3}" - "$url" "$target" <<'PY'
+from pathlib import Path
+from urllib.request import urlopen
+import sys
+
+url, target = sys.argv[1:]
+Path(target).write_bytes(urlopen(url).read())
+PY
+  fi
+}
+
 cache_gedit() {
   "${PYTHON:-python3}" - <<'PY'
 from datasets import load_dataset
@@ -178,6 +198,30 @@ prepare_imgedit() {
     prompts_json="$(find_first "$extract_dir" -type f -iname "prompts.json")"
   fi
   original_dir="$(find_first "$extract_dir" -type d \( -iname "original_images" -o -iname "origin_images" -o -iname "original_image" \))"
+  if [[ -z "$original_dir" ]]; then
+    # Current sysuyy/ImgEdit Benchmark.tar stores Basic-Bench source images as
+    # Benchmark/singleturn/<category>/<image>.jpg, while basic_edit.json uses
+    # relative ids like animal/000342021.jpg.
+    original_dir="$(find_first "$extract_dir" -type d -path "*/Benchmark/singleturn")"
+  fi
+
+  mkdir -p data/processed/benchmark/imgedit third_party/imgedit/Benchmark/Basic
+  if [[ -z "$basic_json" ]]; then
+    basic_json="$download_dir/basic_edit.json"
+    download_url \
+      "https://raw.githubusercontent.com/PKU-YuanGroup/ImgEdit/main/Benchmark/Basic/basic_edit.json" \
+      "$basic_json"
+  fi
+  if [[ -z "$prompts_json" ]]; then
+    if [[ -f third_party/imgedit/Benchmark/Basic/prompts.json ]]; then
+      prompts_json="third_party/imgedit/Benchmark/Basic/prompts.json"
+    else
+      prompts_json="$download_dir/prompts.json"
+      download_url \
+        "https://raw.githubusercontent.com/PKU-YuanGroup/ImgEdit/main/Benchmark/Basic/prompts.json" \
+        "$prompts_json"
+    fi
+  fi
 
   if [[ -z "$basic_json" || -z "$prompts_json" || -z "$original_dir" ]]; then
     echo "Could not locate all ImgEdit Basic-Bench assets after extraction." >&2
@@ -188,7 +232,6 @@ prepare_imgedit() {
     exit 1
   fi
 
-  mkdir -p data/processed/benchmark/imgedit third_party/imgedit/Benchmark/Basic
   cp -f "$basic_json" data/processed/benchmark/imgedit/basic_edit.json
   cp -f "$prompts_json" third_party/imgedit/Benchmark/Basic/prompts.json
   safe_link_or_copy_dir "$original_dir" data/processed/benchmark/imgedit/original_images "$IMGEDIT_MATERIALIZE"
