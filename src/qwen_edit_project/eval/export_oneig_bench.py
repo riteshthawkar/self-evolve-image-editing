@@ -54,6 +54,7 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--no-resume", action="store_true", help="Regenerate prompts even when output files already exist.")
     parser.add_argument("--set", action="append", default=[])
     args = parser.parse_args()
 
@@ -82,15 +83,22 @@ def main() -> None:
     generation = dict(config["generation"])
     failures: list[dict[str, object]] = []
     counts = Counter()
+    skipped = 0
+    written = 0
 
     for index, record in enumerate(records):
         category_dir = ONEIG_CATEGORY_DIRS[record["category"]]
         output_dir = ensure_dir(output_root / category_dir / model_name)
+        output_path = output_dir / f"{record['id']}.webp"
+        if output_path.exists() and not args.no_resume:
+            skipped += 1
+            continue
         images, errors = generate_prompt_samples(pipe, record["prompt"], generation, prompt_index=index)
-        build_sample_grid(images, generation).save(output_dir / f"{record['id']}.webp", format="WEBP")
+        build_sample_grid(images, generation).save(output_path, format="WEBP")
         counts[category_dir] += 1
         if errors:
             failures.append({"id": record["id"], "errors": errors})
+        written += 1
 
     summary = base_run_metadata()
     summary.update(
@@ -99,7 +107,9 @@ def main() -> None:
             "config_path": config["_config_path"],
             "model_name": model_name,
             "checkpoint_path": model_cfg.get("checkpoint_path"),
-            "records_exported": len(records),
+            "records_exported": written,
+            "records_skipped_existing": skipped,
+            "records_requested": len(records),
             "samples_per_prompt": generation.get("samples_per_prompt", 1),
             "output_root": str(output_root),
             "mode": mode,
@@ -111,7 +121,7 @@ def main() -> None:
     if summary_path is None:
         raise ValueError("output.summary_path must resolve")
     save_json(summary, summary_path.parent / f"{model_name}_summary.json")
-    print(f"Exported {len(records)} OneIG-Bench prompts to {output_root}")
+    print(f"Exported {written} OneIG-Bench prompts to {output_root} (skipped {skipped} existing)")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from qwen_edit_project.utils.config import load_yaml_config, merge_override, par
 from qwen_edit_project.eval.export_provenance import (
     build_edit_export_provenance,
     validate_resume_provenance,
+    write_export_provenance,
 )
 from qwen_edit_project.utils.paths import ensure_dir, resolve_path
 from qwen_edit_project.utils.prompting import polish_prompt
@@ -84,6 +85,7 @@ def main() -> None:
         allow_mismatch=bool(config["output"].get("allow_resume_mismatch", False)),
     )
     ensure_dir(output_root)
+    write_export_provenance(output_root, export_provenance)
     pipe = load_qwen_edit_pipeline(
         model_id_with_origin_paths=model_cfg["model_id_with_origin_paths"],
         checkpoint_path=model_cfg.get("checkpoint_path"),

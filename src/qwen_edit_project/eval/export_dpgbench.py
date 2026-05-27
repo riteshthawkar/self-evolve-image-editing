@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 
+from qwen_edit_project.eval.export_provenance import (
+    build_generation_export_provenance,
+    validate_resume_provenance,
+    write_export_provenance,
+)
 from qwen_edit_project.eval.generation_common import build_sample_grid, generate_prompt_samples
 from qwen_edit_project.utils.config import load_yaml_config, merge_override, parse_override, save_json
 from qwen_edit_project.utils.paths import ensure_dir, resolve_path
@@ -29,6 +34,7 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--no-resume", action="store_true", help="Regenerate prompts even when output files already exist.")
     parser.add_argument("--set", action="append", default=[])
     args = parser.parse_args()
 
@@ -45,6 +51,32 @@ def main() -> None:
         prompts = prompts[: args.limit]
 
     model_cfg = config["model"]
+    model_name = model_cfg["model_name"]
+    output_root = ensure_dir(ensure_dir(resolve_path(config["output"]["image_root"])) / model_name)
+    generation = dict(config["generation"])
+    summary_path = resolve_path(config["output"]["summary_path"])
+    if summary_path is None:
+        raise ValueError("output.summary_path must resolve")
+    actual_summary_path = summary_path.parent / f"{model_name}_summary.json"
+    export_provenance = build_generation_export_provenance(config)
+    validate_resume_provenance(
+        benchmark="DPG-Bench",
+        output_root=output_root,
+        summary_path=actual_summary_path,
+        expected=export_provenance,
+        no_resume=args.no_resume,
+        existing_file_patterns=("*.png",),
+    )
+    write_export_provenance(output_root, export_provenance)
+
+    pending_prompts: list[tuple[int, dict[str, str]]] = []
+    skipped = 0
+    for index, item in enumerate(prompts):
+        if (output_root / f"{item['item_id']}.png").exists() and not args.no_resume:
+            skipped += 1
+        else:
+            pending_prompts.append((index, item))
+
     pipe = load_qwen_generation_pipeline(
         model_id_with_origin_paths=model_cfg["model_id_with_origin_paths"],
         checkpoint_path=model_cfg.get("checkpoint_path"),
@@ -54,16 +86,15 @@ def main() -> None:
         torch_dtype=model_cfg.get("torch_dtype", "auto"),
     )
 
-    model_name = model_cfg["model_name"]
-    output_root = ensure_dir(ensure_dir(resolve_path(config["output"]["image_root"])) / model_name)
-    generation = dict(config["generation"])
     failures: list[dict[str, object]] = []
+    written = 0
 
-    for index, item in enumerate(prompts):
+    for index, item in pending_prompts:
         images, errors = generate_prompt_samples(pipe, item["prompt"], generation, prompt_index=index)
         build_sample_grid(images, generation).save(output_root / f"{item['item_id']}.png")
         if errors:
             failures.append({"item_id": item["item_id"], "errors": errors})
+        written += 1
 
     summary = base_run_metadata()
     summary.update(
@@ -72,17 +103,17 @@ def main() -> None:
             "config_path": config["_config_path"],
             "model_name": model_name,
             "checkpoint_path": model_cfg.get("checkpoint_path"),
-            "records_exported": len(prompts),
+            "records_exported": written,
+            "records_skipped_existing": skipped,
+            "records_requested": len(prompts),
             "samples_per_prompt": generation.get("samples_per_prompt", 1),
             "output_root": str(output_root),
             "failures": failures,
+            "export_provenance": export_provenance,
         }
     )
-    summary_path = resolve_path(config["output"]["summary_path"])
-    if summary_path is None:
-        raise ValueError("output.summary_path must resolve")
-    save_json(summary, summary_path.parent / f"{model_name}_summary.json")
-    print(f"Exported {len(prompts)} DPG-Bench prompts to {output_root}")
+    save_json(summary, actual_summary_path)
+    print(f"Exported {written} DPG-Bench prompts to {output_root} (skipped {skipped} existing)")
 
 
 if __name__ == "__main__":

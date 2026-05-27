@@ -9,6 +9,7 @@ from PIL import Image
 from qwen_edit_project.eval.export_provenance import (
     build_edit_export_provenance,
     validate_resume_provenance,
+    write_export_provenance,
 )
 from qwen_edit_project.utils.config import load_yaml_config, merge_override, parse_override, save_json
 from qwen_edit_project.utils.paths import ensure_dir, resolve_path
@@ -56,7 +57,6 @@ def main() -> None:
         raise ValueError("output.summary_path must resolve")
     actual_summary_path = summary_path.parent / f"{model_cfg['model_name']}_summary.json"
     export_provenance = build_edit_export_provenance(config)
-    export_provenance["export"] = {"batch_size": batch_size}
     validate_resume_provenance(
         benchmark="ImgEdit",
         output_root=output_root,
@@ -66,6 +66,7 @@ def main() -> None:
         allow_mismatch=bool(config["output"].get("allow_resume_mismatch", False)),
     )
     ensure_dir(output_root)
+    write_export_provenance(output_root, export_provenance)
 
     pipe = load_qwen_edit_pipeline(
         model_id_with_origin_paths=model_cfg["model_id_with_origin_paths"],
@@ -182,6 +183,7 @@ def main() -> None:
             "records_skipped_existing": skipped,
             "records_failed": failed,
             "records_requested": len(items),
+            "export_batch_size": batch_size,
             "output_root": str(output_root),
             "failures": failures,
             "export_provenance": export_provenance,
