@@ -49,8 +49,10 @@ def parse_override(raw: str) -> tuple[str, Any]:
         raise ValueError(f"Override must be key=value, got: {raw}")
     key, value = raw.split("=", 1)
     lowered = value.lower()
-    if lowered in {"true", "false"}:
-        parsed: Any = lowered == "true"
+    if lowered in {"null", "none"}:
+        parsed: Any = None
+    elif lowered in {"true", "false"}:
+        parsed = lowered == "true"
     else:
         for caster in (int, float):
             try:
@@ -61,4 +63,3 @@ def parse_override(raw: str) -> tuple[str, Any]:
         if isinstance(parsed, str) and parsed.startswith("[") and parsed.endswith("]"):
             parsed = json.loads(parsed)
     return key, parsed
-
