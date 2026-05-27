@@ -55,7 +55,7 @@ def main() -> None:
     )
 
     model_name = model_cfg["model_name"]
-    output_root = ensure_dir(resolve_path(config["output"]["image_root"])) / model_name
+    output_root = ensure_dir(ensure_dir(resolve_path(config["output"]["image_root"])) / model_name)
     generation = dict(config["generation"])
     failures: list[dict[str, object]] = []
 

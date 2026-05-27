@@ -68,7 +68,8 @@ def main() -> None:
 
     model_cfg = config["model"]
     model_name = model_cfg["model_name"]
-    output_root = ensure_dir(resolve_path(config["output"]["edited_images_dir"])) / model_name / "fullset"
+    output_base = ensure_dir(resolve_path(config["output"]["edited_images_dir"]))
+    output_root = output_base / model_name / "fullset"
     summary_path = resolve_path(config["output"]["summary_path"])
     if summary_path is None:
         raise ValueError("output.summary_path must resolve")
@@ -82,6 +83,7 @@ def main() -> None:
         no_resume=args.no_resume,
         allow_mismatch=bool(config["output"].get("allow_resume_mismatch", False)),
     )
+    ensure_dir(output_root)
     pipe = load_qwen_edit_pipeline(
         model_id_with_origin_paths=model_cfg["model_id_with_origin_paths"],
         checkpoint_path=model_cfg.get("checkpoint_path"),

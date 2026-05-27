@@ -78,7 +78,7 @@ def main() -> None:
 
     model_name = model_cfg["model_name"]
     mode = str(config["dataset"].get("mode", "EN")).lower()
-    output_root = ensure_dir(resolve_path(config["output"]["image_root"])) / mode
+    output_root = ensure_dir(ensure_dir(resolve_path(config["output"]["image_root"])) / mode)
     generation = dict(config["generation"])
     failures: list[dict[str, object]] = []
     counts = Counter()
