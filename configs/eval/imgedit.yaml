@@ -33,6 +33,10 @@ output:
   allow_resume_mismatch: false
 scoring:
   num_processes: 4
+  retry_num_processes: 1
+  max_retry_rounds: 5
+  retry_sleep_seconds: 10
+  allow_partial: false
   expected_openai_model: gpt-4.1
 prompting:
   use_prompt_polish: false
