@@ -19,6 +19,117 @@ from qwen_edit_project.utils.paths import ensure_dir, relative_to_repo, resolve_
 
 
 EDIT_FAMILIES = {"exposure", "color", "contrast", "tone", "style", "object", "background", "local"}
+PRIMARY_TRAINING_FAMILIES = ("object", "color", "background")
+COLOR_FAMILY_ALIASES = {"color", "tone", "contrast", "exposure"}
+BACKGROUND_FAMILY_ALIASES = {"background", "style"}
+
+
+def _coerce_str_list(value: Any, default: list[str] | None = None) -> list[str]:
+    if value is None:
+        return list(default or [])
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = [value]
+    output = [str(item).strip() for item in items if str(item).strip()]
+    return output or list(default or [])
+
+
+def _coerce_float_map(value: Any) -> dict[str, float]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        items = value.items()
+    elif isinstance(value, str):
+        items = []
+        for part in value.split(","):
+            if not part.strip() or "=" not in part:
+                continue
+            key, raw_value = part.split("=", 1)
+            items.append((key.strip(), raw_value.strip()))
+    else:
+        return {}
+    output: dict[str, float] = {}
+    for key, raw_value in items:
+        try:
+            number = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0.0:
+            output[str(key).strip()] = number
+    return output
+
+
+def _largest_remainder_counts(labels: list[str], weights: dict[str, float], total_count: int) -> dict[str, int]:
+    if total_count <= 0 or not labels:
+        return {}
+    positive = {label: max(0.0, float(weights.get(label, 0.0))) for label in labels}
+    weight_sum = sum(positive.values())
+    if weight_sum <= 0.0:
+        base = total_count // len(labels)
+        quotas = {label: base for label in labels}
+        for label in labels[: total_count - base * len(labels)]:
+            quotas[label] += 1
+        return quotas
+    raw = {label: total_count * positive[label] / weight_sum for label in labels}
+    quotas = {label: int(math.floor(raw[label])) for label in labels}
+    remaining = total_count - sum(quotas.values())
+    order = sorted(labels, key=lambda label: (raw[label] - quotas[label], positive[label]), reverse=True)
+    for label in order[:remaining]:
+        quotas[label] += 1
+    return quotas
+
+
+def _float_from_mapping(mapping: dict[str, Any], key: str, default: float) -> float:
+    try:
+        return float(mapping.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def candidate_primary_families(
+    item: dict[str, Any],
+    priority: list[str],
+    selection_cfg: dict[str, Any],
+) -> list[str]:
+    raw_families = item.get("edit_families") or (item.get("vlm") or {}).get("edit_families") or []
+    raw_set = {str(family).strip() for family in raw_families if str(family).strip()}
+    vlm = item.get("vlm") or {}
+    family_thresholds = selection_cfg.get("family_thresholds", {}) or {}
+    object_thresholds = family_thresholds.get("object", {}) or {}
+    object_min_clarity = _float_from_mapping(object_thresholds, "min_object_region_clarity", 0.0)
+    object_min_editable = _float_from_mapping(object_thresholds, "min_editable_content_score", 0.0)
+    object_min_removable = _float_from_mapping(object_thresholds, "min_removable_object_score", 0.0)
+    object_min_separability = _float_from_mapping(object_thresholds, "min_small_object_separability", 0.0)
+    object_min_fill = _float_from_mapping(object_thresholds, "min_removal_background_fill_score", 0.0)
+
+    candidates: set[str] = set()
+    if "object" in raw_set:
+        object_region_clarity = _float_from_mapping(vlm, "object_region_clarity", 1.0)
+        editable_content = _float_from_mapping(vlm, "editable_content_score", 1.0)
+        removable_object = _float_from_mapping(vlm, "removable_object_score", 1.0)
+        small_object_separability = _float_from_mapping(vlm, "small_object_separability", 1.0)
+        removal_background_fill = _float_from_mapping(vlm, "removal_background_fill_score", 1.0)
+        if (
+            object_region_clarity >= object_min_clarity
+            and editable_content >= object_min_editable
+            and removable_object >= object_min_removable
+            and small_object_separability >= object_min_separability
+            and removal_background_fill >= object_min_fill
+        ):
+            candidates.add("object")
+    if raw_set & COLOR_FAMILY_ALIASES:
+        candidates.add("color")
+    if raw_set & BACKGROUND_FAMILY_ALIASES:
+        candidates.add("background")
+
+    ordered = [family for family in priority if family in candidates]
+    ordered.extend(sorted(family for family in candidates if family not in ordered))
+    if ordered:
+        return ordered
+    return [str(item.get("primary_family") or next(iter(sorted(raw_set)), "unknown"))]
 
 
 @dataclass
@@ -43,11 +154,15 @@ class VLMJudgment:
     natural_image_score: float
     editable_content_score: float
     object_region_clarity: float
+    removable_object_score: float
+    small_object_separability: float
+    removal_background_fill_score: float
     preservation_potential: float
     clutter_penalty: float
     text_watermark_penalty: float
     edit_families: list[str]
     reject_reasons: list[str]
+    removable_object_description: str | None = None
     raw_response: str | None = None
 
 
@@ -170,13 +285,26 @@ class HeuristicVLMScorer:
         if text_watermark_penalty > 0.25:
             reject_reasons.append("possible_dense_text_or_watermark")
 
+        object_region_clarity = _clamp(0.55 * scores["structure_score"] + 0.45 * scores["entropy_score"])
+        preservation_potential = _clamp(
+            0.55 * scores["sharpness_score"] + 0.45 * scores["structure_score"] - 0.25 * clutter_penalty
+        )
+        small_object_separability = _clamp(0.60 * object_region_clarity + 0.40 * scores["structure_score"] - 0.30 * clutter_penalty)
+        removal_background_fill_score = _clamp(0.65 * preservation_potential + 0.35 * scores["entropy_score"] - 0.25 * clutter_penalty)
+        removable_object_score = _clamp(
+            0.45 * object_region_clarity + 0.30 * small_object_separability + 0.25 * removal_background_fill_score
+        )
+
         return VLMJudgment(
             caption=f"Unlabeled image with {stats.width}x{stats.height} resolution.",
             quality_score=scores["technical_quality_score"],
             natural_image_score=0.75,
             editable_content_score=_clamp(0.25 + 0.12 * len(families)),
-            object_region_clarity=_clamp(0.55 * scores["structure_score"] + 0.45 * scores["entropy_score"]),
-            preservation_potential=_clamp(0.55 * scores["sharpness_score"] + 0.45 * scores["structure_score"] - 0.25 * clutter_penalty),
+            object_region_clarity=object_region_clarity,
+            removable_object_score=removable_object_score,
+            small_object_separability=small_object_separability,
+            removal_background_fill_score=removal_background_fill_score,
+            preservation_potential=preservation_potential,
             clutter_penalty=clutter_penalty,
             text_watermark_penalty=text_watermark_penalty,
             edit_families=families,
@@ -262,10 +390,18 @@ class QwenOpenVLMScorer:
         families = ", ".join(sorted(EDIT_FAMILIES))
         return (
             "You are selecting source images for instruction-guided image editing self-training. "
-            "Judge whether this image is useful for generating verifiable edits. Return only JSON with: "
+            "Judge whether this image is useful for generating verifiable edits. Return only compact JSON "
+            "with no markdown, no prose, and no extra whitespace. Use a caption of 20 words or fewer. "
+            "The JSON object must contain: "
             "caption, quality_score, natural_image_score, editable_content_score, object_region_clarity, "
-            "preservation_potential, clutter_penalty, text_watermark_penalty, edit_families, reject_reasons. "
-            "All scores must be numbers from 0 to 1. edit_families must use only these labels: "
+            "removable_object_score, small_object_separability, removal_background_fill_score, "
+            "removable_object_description, preservation_potential, clutter_penalty, text_watermark_penalty, "
+            "edit_families, reject_reasons. "
+            "All scores must be numbers from 0 to 1. removable_object_score means there is a small, "
+            "secondary, clearly bounded object that can be removed without changing the main subject. "
+            "small_object_separability measures whether that object is visually separated from important content. "
+            "removal_background_fill_score measures whether the surrounding texture/background can plausibly fill the hole. "
+            "edit_families must use only these labels: "
             f"{families}. Prefer images with clear editable content and enough unchanged structure to preserve."
         )
 
@@ -284,6 +420,9 @@ class QwenOpenVLMScorer:
             natural_image_score=0.0,
             editable_content_score=0.0,
             object_region_clarity=0.0,
+            removable_object_score=0.0,
+            small_object_separability=0.0,
+            removal_background_fill_score=0.0,
             preservation_potential=0.0,
             clutter_penalty=1.0,
             text_watermark_penalty=1.0,
@@ -304,11 +443,15 @@ class QwenOpenVLMScorer:
             natural_image_score=_clamp(float(data.get("natural_image_score", 0.0))),
             editable_content_score=_clamp(float(data.get("editable_content_score", 0.0))),
             object_region_clarity=_clamp(float(data.get("object_region_clarity", 0.0))),
+            removable_object_score=_clamp(float(data.get("removable_object_score", 0.0))),
+            small_object_separability=_clamp(float(data.get("small_object_separability", 0.0))),
+            removal_background_fill_score=_clamp(float(data.get("removal_background_fill_score", 0.0))),
             preservation_potential=_clamp(float(data.get("preservation_potential", 0.0))),
             clutter_penalty=_clamp(float(data.get("clutter_penalty", 0.0))),
             text_watermark_penalty=_clamp(float(data.get("text_watermark_penalty", 0.0))),
             edit_families=edit_families,
             reject_reasons=[str(item) for item in data.get("reject_reasons", [])],
+            removable_object_description=data.get("removable_object_description"),
             raw_response=response,
         )
 
@@ -395,6 +538,9 @@ def combine_score(stats_scores: dict[str, float], vlm: VLMJudgment, weights: dic
         "natural_image": vlm.natural_image_score,
         "editable_content": vlm.editable_content_score,
         "object_region_clarity": vlm.object_region_clarity,
+        "removable_object_score": vlm.removable_object_score,
+        "small_object_separability": vlm.small_object_separability,
+        "removal_background_fill_score": vlm.removal_background_fill_score,
         "preservation_potential": vlm.preservation_potential,
         "edit_family_coverage": _clamp(len(vlm.edit_families) / 4.0),
         "clutter_penalty": vlm.clutter_penalty,
@@ -429,6 +575,10 @@ def _asdict_vlm(vlm: VLMJudgment) -> dict[str, Any]:
         "natural_image_score": vlm.natural_image_score,
         "editable_content_score": vlm.editable_content_score,
         "object_region_clarity": vlm.object_region_clarity,
+        "removable_object_score": vlm.removable_object_score,
+        "small_object_separability": vlm.small_object_separability,
+        "removal_background_fill_score": vlm.removal_background_fill_score,
+        "removable_object_description": vlm.removable_object_description,
         "preservation_potential": vlm.preservation_potential,
         "clutter_penalty": vlm.clutter_penalty,
         "text_watermark_penalty": vlm.text_watermark_penalty,
@@ -495,6 +645,12 @@ def threshold_reject_reasons(item: dict[str, Any], thresholds: dict[str, Any]) -
         reject_reasons.append("low_editable_content")
     if float(vlm.get("object_region_clarity", 0.0)) < float(thresholds.get("min_object_region_clarity", 0.0)):
         reject_reasons.append("low_object_region_clarity")
+    if "min_removable_object_score" in thresholds and float(vlm.get("removable_object_score", 0.0)) < float(thresholds["min_removable_object_score"]):
+        reject_reasons.append("low_removable_object_score")
+    if "min_small_object_separability" in thresholds and float(vlm.get("small_object_separability", 0.0)) < float(thresholds["min_small_object_separability"]):
+        reject_reasons.append("low_small_object_separability")
+    if "min_removal_background_fill_score" in thresholds and float(vlm.get("removal_background_fill_score", 0.0)) < float(thresholds["min_removal_background_fill_score"]):
+        reject_reasons.append("low_removal_background_fill_score")
     if float(vlm.get("preservation_potential", 0.0)) < float(thresholds.get("min_preservation_potential", 0.30)):
         reject_reasons.append("low_preservation_potential")
     if len(vlm.get("edit_families", [])) < int(thresholds.get("min_edit_families", 1)):
@@ -589,6 +745,12 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
                     "stats_scores": stats_scores,
                     "vlm": _asdict_vlm(vlm),
                 }
+                family_priority = _coerce_str_list(
+                    selection_cfg.get("primary_family_priority"),
+                    list(PRIMARY_TRAINING_FAMILIES),
+                )
+                item["candidate_primary_families"] = candidate_primary_families(item, family_priority, selection_cfg)
+                item["primary_family"] = item["candidate_primary_families"][0]
                 item = apply_thresholds(item, thresholds)
                 scored.append(item)
                 scored_by_image[image_rel] = item
@@ -617,6 +779,21 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
     max_selected = int(selection_cfg.get("max_selected", 0) or 0)
     min_hash_distance = int(selection_cfg.get("min_average_hash_distance", 6))
     max_family_fraction = float(selection_cfg.get("max_family_fraction", 0.45))
+    target_total = min(max_selected, len(candidates)) if max_selected else len(candidates)
+    target_family_fractions = _coerce_float_map(selection_cfg.get("target_family_fractions"))
+    family_priority = _coerce_str_list(
+        selection_cfg.get("primary_family_priority"),
+        list(target_family_fractions) or list(PRIMARY_TRAINING_FAMILIES),
+    )
+    family_quotas = (
+        _largest_remainder_counts(family_priority, target_family_fractions, target_total)
+        if target_family_fractions
+        else {}
+    )
+    for item in scored:
+        item_candidate_families = candidate_primary_families(item, family_priority, selection_cfg)
+        item["candidate_primary_families"] = item_candidate_families
+        item["primary_family"] = item_candidate_families[0]
 
     selected: list[dict[str, Any]] = []
     family_counts: dict[str, int] = {}
@@ -628,12 +805,27 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
         if any(_hamming(item["stats"]["average_hash"], prior) < min_hash_distance for prior in selected_hashes):
             rejected.append({**item, "accepted": False, "reject_reasons": ["near_duplicate"]})
             continue
-        family = item["primary_family"]
-        family_limit = max(1, math.ceil(max_family_fraction * max(max_selected or len(candidates), 1)))
+        item_candidate_families = candidate_primary_families(item, family_priority, selection_cfg)
+        family = None
+        if family_quotas:
+            for candidate_family in item_candidate_families:
+                if family_counts.get(candidate_family, 0) < family_quotas.get(candidate_family, 0):
+                    family = candidate_family
+                    break
+        if family is None:
+            family = item_candidate_families[0]
+        family_limit = max(1, math.ceil(max_family_fraction * max(target_total, 1)))
+        if family in family_quotas:
+            family_limit = max(family_limit, family_quotas[family])
         if family_counts.get(family, 0) >= family_limit:
             rejected.append({**item, "accepted": False, "reject_reasons": ["family_quota_exceeded"]})
             continue
-        selected.append(item)
+        selected_item = {
+            **item,
+            "primary_family": family,
+            "candidate_primary_families": item_candidate_families,
+        }
+        selected.append(selected_item)
         selected_hashes.append(item["stats"]["average_hash"])
         family_counts[family] = family_counts.get(family, 0) + 1
 
@@ -645,7 +837,12 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
             "metadata": {
                 "source_selection_score": item["score"],
                 "edit_families": item["edit_families"],
+                "candidate_primary_families": item.get("candidate_primary_families", []),
                 "primary_family": item["primary_family"],
+                "removable_object_score": (item.get("vlm") or {}).get("removable_object_score"),
+                "small_object_separability": (item.get("vlm") or {}).get("small_object_separability"),
+                "removal_background_fill_score": (item.get("vlm") or {}).get("removal_background_fill_score"),
+                "removable_object_description": (item.get("vlm") or {}).get("removable_object_description"),
             },
         }
         for item in selected
@@ -666,6 +863,9 @@ def select_images(config: dict[str, Any], limit: int | None = None) -> dict[str,
         "rejected_manifest_jsonl": str(rejected_manifest),
         "score_jsonl": str(score_jsonl),
         "family_counts": family_counts,
+        "target_family_fractions": target_family_fractions,
+        "family_quotas": family_quotas,
+        "primary_family_priority": family_priority,
         "thresholds": thresholds,
         "weights": weights,
     }

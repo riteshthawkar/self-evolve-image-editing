@@ -1,0 +1,65 @@
+name: source_image_filter_heuristic_editing_datasets_5k
+input:
+  source: directory
+  images_dir: data/unlabeled/raw/editing_datasets
+vlm:
+  backend: heuristic
+selection:
+  max_selected: 5000
+  min_average_hash_distance: 5
+  max_family_fraction: 0.70
+  target_family_fractions:
+    object: 0.60
+    background: 0.20
+    color: 0.20
+  primary_family_priority:
+    - object
+    - background
+    - color
+  family_thresholds:
+    object:
+      min_object_region_clarity: 0.38
+      min_editable_content_score: 0.48
+      min_removable_object_score: 0.34
+      min_small_object_separability: 0.32
+      min_removal_background_fill_score: 0.30
+  batch_size: 64
+  progress_every: 500
+  resume_scored: true
+  stream_scores: true
+  thresholds:
+    min_short_side: 384
+    max_aspect_ratio: 2.6
+    min_technical_quality: 0.38
+    min_vlm_quality: 0.38
+    min_natural_image: 0.70
+    min_editable_content: 0.48
+    min_object_region_clarity: 0.34
+    min_removable_object_score: 0.30
+    min_small_object_separability: 0.28
+    min_removal_background_fill_score: 0.28
+    min_preservation_potential: 0.30
+    min_edit_families: 2
+    max_clutter_penalty: 0.70
+    max_text_watermark_penalty: 0.30
+    min_total_score: 0.38
+  weights:
+    technical_quality: 0.18
+    vlm_quality: 0.10
+    natural_image: 0.08
+    editable_content: 0.16
+    object_region_clarity: 0.14
+    removable_object_score: 0.12
+    small_object_separability: 0.10
+    removal_background_fill_score: 0.10
+    preservation_potential: 0.16
+    edit_family_coverage: 0.06
+    clutter_penalty: 0.10
+    text_watermark_penalty: 0.12
+output:
+  selected_manifest_jsonl: data/unlabeled/selected/editing_datasets_heuristic_hq_5k_v1/manifest.jsonl
+  rejected_manifest_jsonl: data/unlabeled/selected/editing_datasets_heuristic_hq_5k_v1/rejected.jsonl
+  score_jsonl: data/unlabeled/selected/editing_datasets_heuristic_hq_5k_v1/scores.jsonl
+  summary_json: data/unlabeled/selected/editing_datasets_heuristic_hq_5k_v1/selection_summary.json
+  materialize_mode: none
+  selected_images_dir: data/unlabeled/selected/editing_datasets_heuristic_hq_5k_v1/images

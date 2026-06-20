@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+.cache/
 .env
 secret.env
 .venv*/
@@ -16,6 +17,8 @@ third_party/*
 
 data/raw/*
 !data/raw/.gitkeep
+data/downloads/
+data/edit_pairs/
 data/manifests/*
 !data/manifests/.gitkeep
 data/unlabeled/*
@@ -29,25 +32,37 @@ data/processed/*
 !data/processed/val/.gitkeep
 !data/processed/benchmark/gedit/
 !data/processed/benchmark/imgedit/
+data/processed/benchmark/gedit/*
+data/processed/benchmark/imgedit/*
 !data/processed/benchmark/gedit/.gitkeep
 !data/processed/benchmark/imgedit/.gitkeep
+
+models/
+models_hf/
 
 outputs/checkpoints/*
 !outputs/checkpoints/.gitkeep
 outputs/validation/*
 !outputs/validation/.gitkeep
+outputs/analysis/
 outputs/benchmark_images/*
 !outputs/benchmark_images/gedit/
 !outputs/benchmark_images/imgedit/
+outputs/benchmark_images/gedit/*
+outputs/benchmark_images/imgedit/*
 !outputs/benchmark_images/gedit/.gitkeep
 !outputs/benchmark_images/imgedit/.gitkeep
 outputs/scores/*
 !outputs/scores/gedit/
 !outputs/scores/imgedit/
+outputs/scores/gedit/*
+outputs/scores/imgedit/*
 !outputs/scores/gedit/.gitkeep
 !outputs/scores/imgedit/.gitkeep
 outputs/logs/*
 !outputs/logs/.gitkeep
+outputs/manifests/
 outputs/presentations/*
+outputs/quick_eval/
 outputs/self_evolve/*
 outputs/*.pdf

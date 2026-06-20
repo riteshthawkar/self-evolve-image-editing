@@ -1,0 +1,72 @@
+name: source_image_filter_gpu24_qwen3vl_editing_datasets_5k_audit
+input:
+  source: jsonl
+  manifest_jsonl: data/unlabeled/selected/editing_datasets_heuristic_hq_5k_v1/manifest.jsonl
+vlm:
+  backend: qwen_vl
+  model_id: Qwen/Qwen3-VL-8B-Instruct
+  device: cuda:0
+  torch_dtype: float16
+  max_new_tokens: 256
+  temperature: 0.0
+  padding_side: left
+  processor_max_pixels: 131072
+selection:
+  max_selected: 5000
+  min_average_hash_distance: 5
+  max_family_fraction: 0.70
+  target_family_fractions:
+    object: 0.60
+    background: 0.20
+    color: 0.20
+  primary_family_priority:
+    - object
+    - background
+    - color
+  family_thresholds:
+    object:
+      min_object_region_clarity: 0.58
+      min_editable_content_score: 0.64
+      min_removable_object_score: 0.42
+      min_small_object_separability: 0.42
+      min_removal_background_fill_score: 0.40
+  batch_size: 1
+  progress_every: 10
+  resume_scored: true
+  stream_scores: true
+  thresholds:
+    min_short_side: 384
+    max_aspect_ratio: 2.6
+    min_technical_quality: 0.45
+    min_vlm_quality: 0.60
+    min_natural_image: 0.60
+    min_editable_content: 0.64
+    min_object_region_clarity: 0.54
+    min_removable_object_score: 0.32
+    min_small_object_separability: 0.32
+    min_removal_background_fill_score: 0.32
+    min_preservation_potential: 0.60
+    min_edit_families: 1
+    max_clutter_penalty: 0.65
+    max_text_watermark_penalty: 0.25
+    min_total_score: 0.66
+  weights:
+    technical_quality: 0.14
+    vlm_quality: 0.12
+    natural_image: 0.10
+    editable_content: 0.18
+    object_region_clarity: 0.16
+    removable_object_score: 0.12
+    small_object_separability: 0.10
+    removal_background_fill_score: 0.10
+    preservation_potential: 0.18
+    edit_family_coverage: 0.06
+    clutter_penalty: 0.10
+    text_watermark_penalty: 0.12
+output:
+  selected_manifest_jsonl: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_5k_audit_v1/manifest.jsonl
+  rejected_manifest_jsonl: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_5k_audit_v1/rejected.jsonl
+  score_jsonl: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_5k_audit_v1/scores.jsonl
+  summary_json: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_5k_audit_v1/selection_summary.json
+  materialize_mode: none
+  selected_images_dir: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_5k_audit_v1/images
