@@ -16,6 +16,7 @@ def build_edit_export_provenance(config: dict[str, Any]) -> dict[str, Any]:
         "base_model": model_cfg.get("base_model"),
         "model_type": model_cfg.get("model_type", "base"),
         "checkpoint_path": model_cfg.get("checkpoint_path"),
+        "lora_scale": model_cfg.get("lora_scale"),
         "torch_dtype": model_cfg.get("torch_dtype", "auto"),
         "generation": {
             "num_inference_steps": generation_cfg.get("num_inference_steps"),

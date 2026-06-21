@@ -1,8 +1,9 @@
-name: self_evolve_qwen_edit_2509_internal_cepr_trainable_proposer
+name: self_evolve_qwen_edit_2509_internal_cepr_rubric_trainable_proposer
 runtime:
   seed: 123
   dry_run: false
   memory_log_enabled: true
+  release_proposer_before_generation: false
 dataset:
   source: jsonl
   manifest_jsonl: data/unlabeled/selected/magicbrush_all_images_moe/manifest_object_primary_focus_rounds96.jsonl
@@ -19,7 +20,6 @@ proposer:
   torch_dtype: bfloat16
   local_files_only: false
   fallback_on_error: false
-  # Keep a small scripted mixture early so the proposer cannot collapse before it has rewards.
   scripted_probability: 0.20
   family_policy: metadata_preferred
   focus_edit_types:
@@ -41,7 +41,6 @@ proposer:
     top_p: 0.9
     do_sample: true
   training:
-    # Use only from an allocated Slurm GPU tmux session.
     trigger: launch
     train_script: src/qwen_edit_project/train/train_proposer_lora.py
     accelerate_executable: accelerate
@@ -74,6 +73,7 @@ proposer:
 editor:
   backend: qwen_edit
   device: auto
+  drop_generation_modules_for_scoring: false
   generation:
     seed: 42
     num_inference_steps: 40
@@ -95,10 +95,10 @@ candidate_generation:
   samples_per_proposal: 4
   seed_stride: 7919
 evaluator:
-  backend: internal_cepr
+  backend: internal_cepr_rubric
   top_m: 1
   counterfactual_distractors: 4
-  edit_threshold: 0.45
+  edit_threshold: 0.40
   preservation_threshold: 0.20
   validity_threshold: 0.50
   reward_threshold: 0.30
@@ -114,7 +114,7 @@ evaluator:
   latent_drift_temperature: 0.15
   taxonomy_enabled: true
   taxonomy_required: true
-  taxonomy_threshold: 0.40
+  taxonomy_threshold: 0.35
   taxonomy_temperature: 0.06
   taxonomy_source_drop_temperature: 0.06
   taxonomy_distractor_temperature: 0.05
@@ -122,6 +122,18 @@ evaluator:
   empty_cache_per_candidate: true
   retry_cpu_on_oom: true
   require_internal_components: true
+  rubric_source_threshold: 0.42
+  rubric_required_threshold: 0.45
+  rubric_forbidden_threshold: 0.42
+  rubric_preservation_threshold: 0.30
+  rubric_reward_threshold: 0.28
+  rubric_gain_temperature: 0.06
+  rubric_abs_temperature: 0.08
+  rubric_preservation_temperature: 0.20
+  rubric_support_center: 0.50
+  rubric_forbidden_absence_center: 0.52
+  max_rubric_items: 3
+  combine_cepr_semantics: true
 curriculum:
   num_rounds: auto
   record_schedule: sequential_shards
@@ -139,6 +151,7 @@ training:
   continue_with_trained_checkpoint: true
   trained_checkpoint_backend: official_diffusers
   resume_from_latest: true
+  # Fast-pilot defaults. Increase rank/modules after reward traces look correct.
   learning_rate: 1.0e-6
   num_epochs: 1
   max_train_steps: 16
@@ -147,6 +160,9 @@ training:
   offload: false
   train_config_overrides:
     lora:
+      lora_rank: 16
+      lora_alpha: 16
+      lora_target_modules: to_q,to_k,to_v,to_out.0,add_q_proj,add_k_proj,add_v_proj,to_add_out
       lora_reference_l2_weight: 0.01
       lora_reference_max_relative_delta: 0.10
   preference:
@@ -179,18 +195,19 @@ training:
     include_rejected: false
     accepted_weight: 1.0
     min_rejected_weight: 0.05
-    max_rejected_weight: 0.50
+    max_rejected_weight: 0.35
     min_raw_reward: 0.15
     target_reward: 0.30
     min_semantic_edit: 0.225
     min_preservation: 0.20
     min_validity: 0.50
+    min_taxonomy: 0.30
     score_power: 1.0
   reconstruction_replay_ratio: 0.15
   reconstruction_replay_weight: 0.50
   reconstruction_replay_prompt: Reconstruct the input image exactly. Preserve all content, layout, colors, and text.
 output:
-  root_dir: outputs/self_evolve/qwen_edit_2509_internal_cepr_trainable_proposer
+  root_dir: outputs/self_evolve/qwen_edit_2509_internal_cepr_rubric_trainable_proposer
   save_all_candidates: true
   use_cumulative_manifest: false
   write_evaluator_training: true

@@ -14,7 +14,22 @@ vlm:
 selection:
   max_selected: 5000
   min_average_hash_distance: 6
-  max_family_fraction: 0.45
+  max_family_fraction: 0.55
+  target_family_fractions:
+    object: 0.50
+    color: 0.25
+    background: 0.25
+  primary_family_priority:
+    - object
+    - color
+    - background
+  family_thresholds:
+    object:
+      min_object_region_clarity: 0.50
+      min_editable_content_score: 0.55
+      min_removable_object_score: 0.45
+      min_small_object_separability: 0.45
+      min_removal_background_fill_score: 0.40
   batch_size: 8
   progress_every: 10
   resume_scored: true
@@ -37,7 +52,10 @@ selection:
     vlm_quality: 0.15
     natural_image: 0.10
     editable_content: 0.20
-    object_region_clarity: 0.15
+    object_region_clarity: 0.12
+    removable_object_score: 0.10
+    small_object_separability: 0.08
+    removal_background_fill_score: 0.08
     preservation_potential: 0.15
     edit_family_coverage: 0.10
     clutter_penalty: 0.08

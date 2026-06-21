@@ -96,6 +96,7 @@ def main() -> None:
         backend=model_cfg.get("backend", "diffsynth"),
         base_model=model_cfg.get("base_model"),
         local_files_only=bool(model_cfg.get("local_files_only", False)),
+        lora_scale=model_cfg.get("lora_scale"),
     )
 
     generation = dict(config["generation"])
