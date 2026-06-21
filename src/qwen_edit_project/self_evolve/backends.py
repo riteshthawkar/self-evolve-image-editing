@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 import random
+import re
 import statistics
 import gc
 from typing import Any
@@ -15,11 +17,14 @@ from qwen_edit_project.self_evolve.edit_schema import (
     structured_edit_prompt,
 )
 from qwen_edit_project.self_evolve.image_metrics import (
+    box_mask_from_boxes,
     changed_fraction,
+    diff_mask,
     diff_region_statistics,
     edge_preservation_score,
     luminance_mean,
     luminance_std,
+    masked_region_statistics,
     mean_absolute_difference,
     saturation_mean,
     warmth_score,
@@ -50,6 +55,71 @@ INVERSE_OPERATION_MAP = {
 INTERNAL_ONLY_METRICS = {"internal_prompt_gain", "semantic"}
 
 
+DEFAULT_TEMPLATE_TARGET_BANK = {
+    "replacement_objects": [
+        "red ceramic cup",
+        "blue canvas tote bag",
+        "yellow tennis ball",
+        "black camera",
+        "silver flashlight",
+        "orange traffic cone",
+        "white flower vase",
+        "striped scarf",
+        "brown leather wallet",
+        "small wooden box",
+        "green glass bottle",
+        "purple notebook",
+        "gray headphones",
+        "pink umbrella",
+        "metal water bottle",
+        "woven basket",
+        "black baseball cap",
+        "clear drinking glass",
+        "white coffee mug",
+        "blue toy car",
+        "red apple",
+        "yellow rubber duck",
+        "small plant pot",
+        "folded newspaper",
+    ],
+    "addition_objects": [
+        "small red apple",
+        "blue notebook",
+        "white ceramic cup",
+        "yellow tennis ball",
+        "black camera",
+        "silver keychain",
+        "green glass bottle",
+        "orange traffic cone",
+        "folded newspaper",
+        "small wooden box",
+        "purple flower pot",
+        "brown paper bag",
+        "gray headphones",
+        "striped scarf",
+        "clear drinking glass",
+        "metal water bottle",
+        "small toy car",
+        "pink umbrella",
+        "woven basket",
+        "black baseball cap",
+    ],
+    "colors": ["deep blue", "warm yellow", "matte black", "soft green", "bright red", "clean white", "muted purple", "burnt orange", "silver gray"],
+    "materials": ["brushed metal", "polished wood", "matte ceramic", "dark leather", "woven fabric", "clear glass", "brushed steel", "smooth marble"],
+    "attributes": [
+        "a subtle striped pattern",
+        "a glossy finish",
+        "a matte finish",
+        "a cleaner newer appearance",
+        "a slightly brighter highlight",
+        "a fine dotted pattern",
+        "a soft fabric texture",
+    ],
+    "style_targets": ["watercolor painting", "cinematic film still", "soft pencil sketch", "vintage photo", "clean product photo", "comic book illustration"],
+    "background_targets": ["soft garden background", "plain studio backdrop", "sunny outdoor background", "neutral indoor wall", "clean kitchen background"],
+}
+
+
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
     return max(minimum, min(maximum, value))
 
@@ -60,6 +130,14 @@ def _sigmoid(value: float) -> float:
         return 1.0 / (1.0 + z)
     z = math.exp(value)
     return z / (1.0 + z)
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def _mean_changed_fraction_score(value: float, expected_range: tuple[float, float]) -> float:
@@ -201,6 +279,11 @@ class ScriptedProposer:
                 definition=proposal,
                 difficulty_level=difficulty_level,
                 instruction=proposal.instruction,
+                structured_edit=normalize_structured_edit(
+                    {},
+                    instruction=proposal.instruction,
+                    family=proposal.family,
+                ),
             )
             for index, proposal in enumerate(selected)
         ]
@@ -244,6 +327,24 @@ class TrainableQwenVLProposer:
         self.generation = dict(config.get("generation", {}))
         self.fallback_on_error = bool(config.get("fallback_on_error", True))
         self.scripted_probability = float(config.get("scripted_probability", 0.25))
+        self.allowed_edit_types = self._string_set(config.get("allowed_edit_types") or config.get("focus_edit_types"))
+        self.disallowed_edit_types = self._string_set(
+            config.get("disallowed_edit_types") or config.get("avoid_edit_types")
+        )
+        self.enforce_record_target_edit_type = bool(config.get("enforce_record_target_edit_type", False))
+        self.template_fallback_on_target_miss = bool(config.get("template_fallback_on_target_miss", False))
+        self.force_template_from_record = bool(config.get("force_template_from_record", False))
+        self.template_bootstrap_rounds = max(0, int(config.get("template_bootstrap_rounds", 0)))
+        self.strict_edit_type_filter = bool(config.get("strict_edit_type_filter", False))
+        self.max_generation_attempts = max(1, int(config.get("max_generation_attempts", 1)))
+        self.template_target_bank = {key: list(value) for key, value in DEFAULT_TEMPLATE_TARGET_BANK.items()}
+        for key, value in dict(config.get("template_target_bank", {})).items():
+            if isinstance(value, str):
+                values = [part.strip() for part in value.split(",") if part.strip()]
+            else:
+                values = [str(item).strip() for item in value if str(item).strip()]
+            if values:
+                self.template_target_bank[str(key)] = values
         fallback_config = dict(config.get("scripted_fallback", {}))
         fallback_config.setdefault("families", config.get("families"))
         fallback_config.setdefault("operation_ids", config.get("operation_ids"))
@@ -293,6 +394,479 @@ class TrainableQwenVLProposer:
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(device)
 
+    @staticmethod
+    def _string_set(value: Any) -> set[str]:
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            raw_items = [part.strip() for part in value.split(",")]
+        else:
+            raw_items = [str(item).strip() for item in value]
+        return {item for item in raw_items if item}
+
+    def _template_bank_values(self, key: str) -> list[str]:
+        values = self.template_target_bank.get(key) or DEFAULT_TEMPLATE_TARGET_BANK.get(key) or []
+        return [str(value).strip() for value in values if str(value).strip()]
+
+    @staticmethod
+    def _template_choice(values: list[str], stable_choice: int, salt: str) -> str:
+        if not values:
+            raise ValueError("Template target bank is empty")
+        salted = stable_choice + sum(ord(char) for char in salt)
+        return values[salted % len(values)]
+
+    @staticmethod
+    def _indefinite_phrase(noun: str) -> str:
+        stripped = noun.strip()
+        if not stripped:
+            return stripped
+        if stripped.lower().startswith(("a ", "an ", "the ")):
+            return stripped
+        article = "an" if stripped[0].lower() in {"a", "e", "i", "o", "u"} else "a"
+        return f"{article} {stripped}"
+
+    @staticmethod
+    def _replacement_overlaps_source(replacement: str, source_object: str | None) -> bool:
+        if not source_object:
+            return False
+        replacement_terms = {term for term in re.findall(r"[a-z0-9]+", replacement.lower()) if len(term) > 2}
+        source_terms = {term for term in re.findall(r"[a-z0-9]+", source_object.lower()) if len(term) > 2}
+        if not replacement_terms or not source_terms:
+            return False
+        return bool(replacement_terms & source_terms) or replacement.lower() in source_object.lower() or source_object.lower() in replacement.lower()
+
+    def _template_target_choice(
+        self,
+        key: str,
+        stable_choice: int,
+        salt: str,
+        *,
+        source_object: str | None = None,
+    ) -> str:
+        values = self._template_bank_values(key)
+        if source_object:
+            filtered = [value for value in values if not self._replacement_overlaps_source(value, source_object)]
+            if filtered:
+                values = filtered
+        return self._template_choice(values, stable_choice, salt)
+
+    def _edit_type_allowed(self, structured_edit: dict[str, Any]) -> bool:
+        edit_type = str(structured_edit.get("edit_type", ""))
+        if self.allowed_edit_types and edit_type not in self.allowed_edit_types:
+            return False
+        if self.disallowed_edit_types and edit_type in self.disallowed_edit_types:
+            return False
+        return True
+
+    def _record_target_edit_type(self, record: UnlabeledImageRecord) -> str | None:
+        if not self.enforce_record_target_edit_type:
+            return None
+        metadata = record.metadata or {}
+        value = metadata.get("scheduled_edit_type") or metadata.get("target_edit_type")
+        if value is None:
+            return None
+        edit_type = str(value).strip()
+        if not edit_type:
+            return None
+        if self.allowed_edit_types and edit_type not in self.allowed_edit_types:
+            return None
+        if self.disallowed_edit_types and edit_type in self.disallowed_edit_types:
+            return None
+        return edit_type
+
+    @staticmethod
+    def _caption_object_candidates(record: UnlabeledImageRecord) -> list[str]:
+        metadata = record.metadata or {}
+        candidates: list[str] = []
+        raw_objects = metadata.get("objects") or metadata.get("object_tags") or []
+        if isinstance(raw_objects, str):
+            raw_objects = [part.strip() for part in raw_objects.split(",")]
+        if isinstance(raw_objects, list):
+            candidates.extend(str(item).strip().lower() for item in raw_objects if str(item).strip())
+
+        caption = str(record.caption or "").lower()
+        multiword_objects = [
+            "party hat",
+            "life vest",
+            "surfboard",
+            "cutting board",
+            "sports bag",
+            "baseball bat",
+            "water bottle",
+            "speech bubble",
+            "fire hydrant",
+            "fighter jet",
+            "teddy bear",
+            "freestanding bathtub",
+            "glass-enclosed shower",
+            "double sink vanity",
+            "mounted tv",
+            "window frame",
+            "green beans",
+        ]
+        for phrase in multiword_objects:
+            if phrase in caption:
+                candidates.append(phrase)
+
+        object_nouns = {
+            "airplane",
+            "ball",
+            "bag",
+            "basket",
+            "bat",
+            "bathtub",
+            "beans",
+            "bench",
+            "bottle",
+            "bowl",
+            "car",
+            "carrot",
+            "cat",
+            "celery",
+            "chair",
+            "chicken",
+            "crown",
+            "cup",
+            "door",
+            "dog",
+            "dress",
+            "floor",
+            "frisbee",
+            "hat",
+            "hydrant",
+            "jet",
+            "knife",
+            "mirror",
+            "motorcycle",
+            "onion",
+            "oven",
+            "pizza",
+            "rack",
+            "shirt",
+            "shoes",
+            "shower",
+            "sink",
+            "table",
+            "tile",
+            "tv",
+            "turtle",
+            "umbrella",
+            "vanity",
+            "vegetables",
+            "vest",
+            "wall",
+            "window",
+        }
+        stopwords = {
+            "a",
+            "an",
+            "and",
+            "with",
+            "near",
+            "next",
+            "to",
+            "on",
+            "in",
+            "of",
+            "from",
+            "including",
+            "attached",
+            "wearing",
+            "holding",
+            "sitting",
+            "standing",
+            "looking",
+        }
+        tokens = re.findall(r"[a-z0-9]+", caption)
+        for index, token in enumerate(tokens):
+            singular = token[:-1] if len(token) > 3 and token.endswith("s") else token
+            if singular not in object_nouns:
+                continue
+            start = index
+            while start > 0 and index - start < 3 and tokens[start - 1] not in stopwords:
+                start -= 1
+            phrase = " ".join(tokens[start : index + 1]).strip()
+            if phrase:
+                candidates.append(phrase)
+
+        seen = set()
+        output = []
+        for candidate in candidates:
+            candidate = re.sub(r"\s+", " ", candidate).strip(" .,;:")
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            output.append(candidate)
+        return output
+
+    @staticmethod
+    def _secondary_object_preferred(candidate: str) -> bool:
+        lowered = candidate.lower()
+        preferred_terms = {
+            "hat",
+            "vest",
+            "pizza",
+            "surfboard",
+            "bag",
+            "bat",
+            "bottle",
+            "flame",
+            "umbrella",
+            "knife",
+            "onion",
+            "ball",
+            "turtle",
+            "bear",
+            "frisbee",
+            "bubble",
+            "hydrant",
+            "crown",
+            "rack",
+            "basket",
+            "bathtub",
+            "shower",
+            "sink",
+            "vanity",
+            "mirror",
+            "tv",
+            "window",
+            "cutting board",
+            "green beans",
+            "carrot",
+            "celery",
+            "chicken",
+            "motorcycle",
+        }
+        dominant_terms = {"person", "man", "woman", "child", "dog", "cat", "elephant", "airplane", "car"}
+        return any(term in lowered for term in preferred_terms) and not any(term in lowered for term in dominant_terms)
+
+    @staticmethod
+    def _template_target_region(record: UnlabeledImageRecord, source_object: str | None) -> str:
+        if not source_object:
+            return "near the main subject in the visible scene"
+        obj = source_object.lower()
+        caption = str(record.caption or "").lower()
+        has_person = any(term in caption for term in ("person", "man", "woman", "child", "boy", "girl"))
+        has_table = any(term in caption for term in ("table", "counter", "plate", "cutting board"))
+
+        if "hat" in obj or "crown" in obj:
+            return "on the person's head" if has_person else "on the main subject's head"
+        if "vest" in obj or "shirt" in obj or "dress" in obj or "shoes" in obj:
+            return "on the person's body" if has_person else "on the main subject"
+        if "bag" in obj or "backpack" in obj:
+            return "beside the person" if has_person else "near the main subject"
+        if "bat" in obj or "frisbee" in obj or "ball" in obj or "umbrella" in obj:
+            return "near the person's hands" if has_person else "near the main subject"
+        if "surfboard" in obj:
+            return "under or beside the person" if has_person else "in the foreground"
+        if "bottle" in obj or "cup" in obj or "mug" in obj or "bowl" in obj:
+            return "on the table" if has_table else "near the foreground surface"
+        if any(term in obj for term in ("knife", "onion", "carrot", "celery", "beans", "chicken", "pizza")):
+            return "on the cutting board or plate" if has_table else "in the food preparation area"
+        if any(term in obj for term in ("bathtub", "shower", "sink", "vanity", "mirror", "tv", "window")):
+            return "in the bathroom scene"
+        if "hydrant" in obj:
+            return "beside the street or sidewalk"
+        if "turtle" in obj or "bear" in obj:
+            return "near the main subject"
+        return "near the main subject in the visible scene"
+
+    @staticmethod
+    def _template_region_phrase(region: str) -> str:
+        lowered = region.lower()
+        if lowered.startswith(
+            (
+                "on ",
+                "above ",
+                "below ",
+                "under ",
+                "beneath ",
+                "beside ",
+                "near ",
+                "next to ",
+                "left of ",
+                "right of ",
+                "in front of ",
+                "behind ",
+                "between ",
+                "attached to ",
+                "held by ",
+                "worn by ",
+                "around ",
+                "at ",
+                "in ",
+            )
+        ):
+            return region
+        return f"at {region}"
+
+    def _template_target_payload(
+        self,
+        record: UnlabeledImageRecord,
+        edit_type: str,
+        seed: int,
+    ) -> dict[str, Any] | None:
+        candidates = self._caption_object_candidates(record)
+        source_object = None
+        for candidate in candidates:
+            if self._secondary_object_preferred(candidate):
+                source_object = candidate
+                break
+        if source_object is None and candidates:
+            source_object = candidates[0]
+
+        stable_choice = sum(ord(char) for char in record.key) + int(seed)
+        replacement = self._template_target_choice(
+            "replacement_objects",
+            stable_choice,
+            f"{record.key}:replacement:{edit_type}",
+            source_object=source_object,
+        )
+        addition_object = self._template_target_choice(
+            "addition_objects",
+            stable_choice,
+            f"{record.key}:addition:{edit_type}",
+            source_object=source_object,
+        )
+        color = self._template_target_choice("colors", stable_choice, f"{record.key}:color:{edit_type}")
+        material = self._template_target_choice("materials", stable_choice, f"{record.key}:material:{edit_type}")
+        attribute = self._template_target_choice("attributes", stable_choice, f"{record.key}:attribute:{edit_type}")
+        style_target = self._template_target_choice("style_targets", stable_choice, f"{record.key}:style:{edit_type}")
+        background_target = self._template_target_choice("background_targets", stable_choice, f"{record.key}:background:{edit_type}")
+        preserve = ["main subject", "background", "lighting", "camera viewpoint"]
+        target_region = self._template_target_region(record, source_object)
+        target_region_phrase = self._template_region_phrase(target_region)
+
+        if edit_type == "object_removal" and source_object:
+            return {
+                "edit_type": "object_removal",
+                "instruction": (
+                    f"Remove the {source_object} {target_region_phrase}. "
+                    "Keep all other content, lighting, and layout unchanged."
+                ),
+                "source_object": source_object,
+                "target_region": target_region,
+                "required_after": [f"the area {target_region_phrase} is cleanly filled after removing {source_object}"],
+                "forbidden_after": [f"{source_object} remains visible {target_region_phrase}"],
+                "preserve": preserve,
+            }
+        if edit_type == "object_replacement" and source_object:
+            if self._replacement_overlaps_source(replacement, source_object):
+                replacement = self._template_target_choice(
+                    "replacement_objects",
+                    stable_choice + 1,
+                    f"{record.key}:replacement:fallback:{edit_type}",
+                    source_object=source_object,
+                )
+            replacement_phrase = self._indefinite_phrase(replacement)
+            return {
+                "edit_type": "object_replacement",
+                "instruction": (
+                    f"Replace the {source_object} {target_region_phrase} with {replacement_phrase}. "
+                    "Keep the same location and approximate size, and keep all other content unchanged."
+                ),
+                "source_object": source_object,
+                "target_object": replacement,
+                "replacement": replacement,
+                "target_region": target_region,
+                "required_after": [f"{replacement} is visible {target_region_phrase}"],
+                "forbidden_after": [f"{source_object} remains visible {target_region_phrase}"],
+                "preserve": preserve,
+            }
+        if edit_type == "object_addition":
+            added_object = addition_object
+            added_object_phrase = self._indefinite_phrase(added_object)
+            return {
+                "edit_type": "object_addition",
+                "instruction": f"Add {added_object_phrase} to a plausible open area of the scene.",
+                "target_object": added_object,
+                "replacement": added_object,
+                "target_region": "a plausible open area of the scene",
+                "required_after": [f"{added_object} has been added to a plausible open area of the scene"],
+                "forbidden_after": [],
+                "preserve": preserve,
+            }
+        if edit_type == "color_change" and source_object:
+            return {
+                "edit_type": "color_change",
+                "instruction": f"Change the color of the {source_object} to {color} while preserving the rest of the scene.",
+                "source_object": source_object,
+                "target_attribute": color,
+                "target_region": source_object,
+                "required_after": [f"the {source_object} is {color}"],
+                "forbidden_after": [f"the {source_object} keeps its original color"],
+                "preserve": preserve,
+            }
+        if edit_type == "attribute_change" and source_object:
+            return {
+                "edit_type": "attribute_change",
+                "instruction": f"Give the {source_object} {attribute} while preserving its shape and surroundings.",
+                "source_object": source_object,
+                "target_attribute": attribute,
+                "target_region": source_object,
+                "required_after": [f"the {source_object} has {attribute}"],
+                "forbidden_after": [f"the {source_object} remains unchanged"],
+                "preserve": preserve,
+            }
+        if edit_type == "material_change" and source_object:
+            return {
+                "edit_type": "material_change",
+                "instruction": f"Change the {source_object} material to {material} while keeping its shape and location.",
+                "source_object": source_object,
+                "target_material": material,
+                "target_region": source_object,
+                "required_after": [f"the {source_object} appears made of {material}"],
+                "forbidden_after": [f"the {source_object} keeps its original material"],
+                "preserve": preserve,
+            }
+        if edit_type == "spatial_move" and source_object:
+            directions = ["slightly to the left", "slightly to the right", "slightly upward"]
+            target_location = directions[stable_choice % len(directions)]
+            return {
+                "edit_type": "spatial_move",
+                "instruction": f"Move the {source_object} {target_location} while preserving the rest of the image.",
+                "source_object": source_object,
+                "source_location": "its original location",
+                "target_location": target_location,
+                "target_region": source_object,
+                "required_after": [f"the {source_object} is moved {target_location}"],
+                "forbidden_after": [f"the {source_object} remains in its original location"],
+                "preserve": preserve,
+            }
+        if edit_type == "background_change":
+            subject = source_object or "main subject"
+            return {
+                "edit_type": "background_change",
+                "instruction": f"Change the background behind the {subject} to a {background_target} while preserving the {subject}.",
+                "source_object": subject,
+                "target_attribute": background_target,
+                "target_region": "background",
+                "required_after": [f"the background is a {background_target}"],
+                "forbidden_after": ["the original background remains unchanged"],
+                "preserve": [subject, "lighting consistency", "camera viewpoint"],
+            }
+        if edit_type == "style_transfer":
+            return {
+                "edit_type": "style_transfer",
+                "instruction": f"Convert the image into a {style_target} style while preserving the scene layout and main objects.",
+                "target_style": style_target,
+                "target_region": "whole image",
+                "required_after": [f"the image has a {style_target} style"],
+                "forbidden_after": ["the image remains in the original photographic style"],
+                "preserve": ["scene layout", "main objects", "camera viewpoint"],
+            }
+        if edit_type == "local_enhancement" and source_object:
+            return {
+                "edit_type": "local_enhancement",
+                "instruction": f"Enhance the detail and clarity of the {source_object} without changing the rest of the image.",
+                "source_object": source_object,
+                "target_region": source_object,
+                "required_after": [f"the {source_object} has clearer local detail"],
+                "forbidden_after": [f"the {source_object} stays blurry or unchanged"],
+                "preserve": preserve,
+            }
+        return None
+
     def _ensure_model(self):
         if self.model is not None and self.processor is not None:
             return self.model, self.processor
@@ -341,11 +915,82 @@ class TrainableQwenVLProposer:
         if record.caption:
             metadata_hint += f"\nImage caption: {record.caption}"
         if record.metadata:
-            keys = ["primary_family", "edit_families", "objects", "scene", "style"]
+            keys = [
+                "primary_family",
+                "edit_families",
+                "objects",
+                "scene",
+                "style",
+                "experiment_focus",
+                "target_edit_types",
+                "avoid_edit_types",
+                "scheduled_edit_type",
+                "underrepresented_edit_types",
+                "scheduled_family",
+            ]
             parts = [f"{key}: {record.metadata[key]}" for key in keys if key in record.metadata]
             if parts:
                 metadata_hint += "\nMetadata: " + "; ".join(parts)
-        prompt = structured_edit_prompt(difficulty_level, proposals_per_image) + metadata_hint
+        focus_edit_types = self.config.get("focus_edit_types") or self.config.get("target_edit_types")
+        avoid_edit_types = self.config.get("avoid_edit_types")
+        focus_hint = ""
+        if focus_edit_types:
+            focus_hint += (
+                "\nExperiment focus: propose only edits from these edit_type values when visually feasible: "
+                f"{focus_edit_types}."
+            )
+        if avoid_edit_types:
+            focus_hint += (
+                "\nAvoid these edit_type values for this run unless there is no feasible alternative: "
+                f"{avoid_edit_types}."
+            )
+        coverage_edit_types = self.config.get("coverage_edit_types") or self.config.get("curriculum_edit_types")
+        if coverage_edit_types:
+            focus_hint += (
+                "\nCoverage objective: across rounds, prefer underrepresented medium-hard local edits from "
+                f"{coverage_edit_types}. Do not repeatedly choose only easy additions or global color changes "
+                "when removal, replacement, spatial, material, or attribute edits are visually feasible."
+            )
+        coverage_guidance = str(self.config.get("coverage_guidance", "")).strip()
+        if coverage_guidance:
+            focus_hint += "\n" + coverage_guidance
+        focus_values = {str(item) for item in (focus_edit_types or [])}
+        if focus_values & {"object_removal", "object_replacement"}:
+            focus_hint += (
+                "\nObject-edit acceptance guidance: choose localized, clearly separable targets. "
+                "Do not ask to remove or replace the main person, animal, vehicle, large furniture, "
+                "or the whole background. Prefer accessories, small foreground/background objects, "
+                "signs, cups, hats, bags, or other secondary objects. For object_removal, the "
+                "instruction must explicitly say to remove the object completely and fill the area "
+                "naturally with the surrounding scene. For object_replacement, keep the same "
+                "location and approximate size, and name both the old object and concrete new object. "
+                "For both removal and replacement, target_region must be spatially grounded against "
+                "stable visible context, for example 'above the airplane', 'on the table', or "
+                "'left of the person'; avoid generic target regions when a visible anchor exists."
+            )
+        target_edit_type = self._record_target_edit_type(record)
+        if target_edit_type:
+            focus_hint += (
+                "\nMandatory edit-type constraint for this sample: every returned proposal must use "
+                f"edit_type={target_edit_type}. Do not substitute another object edit type."
+            )
+            if target_edit_type == "object_addition":
+                focus_hint += (
+                    " Add a small concrete object in a plausible empty region while preserving all existing "
+                    "objects and the global scene."
+                )
+            elif target_edit_type == "object_replacement":
+                focus_hint += (
+                    " Replace a small existing secondary object with a concrete new object at the same "
+                    "location and approximate size. Include a spatial target_region anchored to a stable "
+                    "visible object."
+                )
+            elif target_edit_type == "object_removal":
+                focus_hint += (
+                    " Remove a small existing secondary object completely and fill the area naturally. "
+                    "Include a spatial target_region anchored to a stable visible object."
+                )
+        prompt = structured_edit_prompt(difficulty_level, proposals_per_image) + metadata_hint + focus_hint
         return [
             {
                 "role": "system",
@@ -412,42 +1057,139 @@ class TrainableQwenVLProposer:
         seed: int,
     ) -> list[EditProposal]:
         rng = random.Random(seed + round_index * 100_003 + sum(ord(char) for char in record.key))
+        target_edit_type = self._record_target_edit_type(record)
+        use_template_bootstrap = (
+            bool(target_edit_type)
+            and (self.force_template_from_record or round_index <= self.template_bootstrap_rounds)
+        )
+        if target_edit_type and use_template_bootstrap:
+            payload = self._template_target_payload(record, target_edit_type, seed)
+            if payload is None and self.force_template_from_record:
+                return []
+            if payload is not None:
+                structured_edit = normalize_structured_edit(payload, instruction=str(payload["instruction"]))
+                if self._edit_type_allowed(structured_edit) and structured_edit.get("edit_type") == target_edit_type:
+                    definition = proposal_definition_from_structured_edit(
+                        structured_edit,
+                        proposal_index=0,
+                        difficulty_level=difficulty_level,
+                    )
+                    return [
+                        EditProposal(
+                            record_key=record.key,
+                            round_index=round_index,
+                            proposal_index=0,
+                            definition=definition,
+                            difficulty_level=difficulty_level,
+                            instruction=definition.instruction,
+                            structured_edit=structured_edit,
+                        )
+                    ]
+            if self.force_template_from_record:
+                return []
         if self.scripted_probability > 0 and rng.random() < self.scripted_probability:
-            return self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
-        try:
-            payloads = self._generate_payloads(record, difficulty_level, proposals_per_image)
-        except Exception:
-            if not self.fallback_on_error:
-                raise
-            return self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
-
+            scripted = self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
+            scripted = [proposal for proposal in scripted if self._edit_type_allowed(proposal.structured_edit)]
+            if target_edit_type:
+                scripted = [
+                    proposal for proposal in scripted if proposal.structured_edit.get("edit_type") == target_edit_type
+                ]
+            if scripted:
+                return scripted
+            if target_edit_type and self.template_fallback_on_target_miss:
+                payload = self._template_target_payload(record, target_edit_type, seed)
+                if payload is not None:
+                    structured_edit = normalize_structured_edit(payload, instruction=str(payload["instruction"]))
+                    if self._edit_type_allowed(structured_edit) and structured_edit.get("edit_type") == target_edit_type:
+                        definition = proposal_definition_from_structured_edit(
+                            structured_edit,
+                            proposal_index=0,
+                            difficulty_level=difficulty_level,
+                        )
+                        return [
+                            EditProposal(
+                                record_key=record.key,
+                                round_index=round_index,
+                                proposal_index=0,
+                                definition=definition,
+                                difficulty_level=difficulty_level,
+                                instruction=definition.instruction,
+                                structured_edit=structured_edit,
+                            )
+                        ]
+            return []
         proposals: list[EditProposal] = []
-        for index, payload in enumerate(payloads[:proposals_per_image]):
-            instruction = str(payload.get("instruction", "")).strip()
-            if not instruction:
-                continue
-            structured_edit = normalize_structured_edit(payload, instruction=instruction)
-            definition = proposal_definition_from_structured_edit(
-                structured_edit,
-                proposal_index=index,
-                difficulty_level=difficulty_level,
-            )
-            proposals.append(
-                EditProposal(
-                    record_key=record.key,
-                    round_index=round_index,
-                    proposal_index=index,
-                    definition=definition,
+        for _ in range(self.max_generation_attempts):
+            try:
+                payloads = self._generate_payloads(record, difficulty_level, proposals_per_image)
+            except Exception:
+                if not self.fallback_on_error:
+                    raise
+                fallback = self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
+                return [
+                    proposal for proposal in fallback if self._edit_type_allowed(proposal.structured_edit)
+                ]
+
+            for payload in payloads:
+                instruction = str(payload.get("instruction", "")).strip()
+                if not instruction:
+                    continue
+                structured_edit = normalize_structured_edit(payload, instruction=instruction)
+                if not self._edit_type_allowed(structured_edit):
+                    continue
+                if target_edit_type and structured_edit.get("edit_type") != target_edit_type:
+                    continue
+                definition = proposal_definition_from_structured_edit(
+                    structured_edit,
+                    proposal_index=len(proposals),
                     difficulty_level=difficulty_level,
-                    instruction=definition.instruction,
-                    structured_edit=structured_edit,
                 )
-            )
+                proposals.append(
+                    EditProposal(
+                        record_key=record.key,
+                        round_index=round_index,
+                        proposal_index=len(proposals),
+                        definition=definition,
+                        difficulty_level=difficulty_level,
+                        instruction=definition.instruction,
+                        structured_edit=structured_edit,
+                    )
+                )
+                if len(proposals) >= proposals_per_image:
+                    return proposals
+            if proposals:
+                return proposals
         if proposals:
             return proposals
-        if not self.fallback_on_error:
+        target_edit_type = self._record_target_edit_type(record)
+        if target_edit_type and self.template_fallback_on_target_miss:
+            payload = self._template_target_payload(record, target_edit_type, seed)
+            if payload is not None:
+                structured_edit = normalize_structured_edit(payload, instruction=str(payload["instruction"]))
+                if self._edit_type_allowed(structured_edit) and structured_edit.get("edit_type") == target_edit_type:
+                    definition = proposal_definition_from_structured_edit(
+                        structured_edit,
+                        proposal_index=0,
+                        difficulty_level=difficulty_level,
+                    )
+                    return [
+                        EditProposal(
+                            record_key=record.key,
+                            round_index=round_index,
+                            proposal_index=0,
+                            definition=definition,
+                            difficulty_level=difficulty_level,
+                            instruction=definition.instruction,
+                            structured_edit=structured_edit,
+                        )
+                    ]
+        if self.strict_edit_type_filter or not self.fallback_on_error:
             return []
-        return self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
+        return [
+            proposal
+            for proposal in self.scripted.propose(record, round_index, difficulty_level, proposals_per_image, seed)
+            if self._edit_type_allowed(proposal.structured_edit)
+        ]
 
 
 class PillowPrototypeEditor:
@@ -477,6 +1219,7 @@ class QwenEditEditor:
         self.config = config
         self.device = config.get("device", "auto")
         self.generation = dict(config.get("generation", {}))
+        self.drop_generation_modules_for_scoring = bool(config.get("drop_generation_modules_for_scoring", True))
         self.pipeline = None
         self.current_checkpoint_path = config["model"].get("checkpoint_path")
         self.generation_modules_dropped = False
@@ -607,6 +1350,12 @@ class QwenEditEditor:
         so we drop generation-only modules and reload them before the next generation.
         """
         pipeline = self._ensure_pipeline()
+        if not self.drop_generation_modules_for_scoring:
+            device = scoring_device or self._resolved_torch_device()
+            for name in ("text_encoder", "vae"):
+                self._move_module(getattr(pipeline, name, None), device)
+            self._empty_cuda_cache()
+            return
         # CEPR scoring only needs the text/understanding path and VAE. Moving the
         # full diffusion transformer to CPU can exceed host RAM on long runs, so
         # drop generation-only modules and reload them before the next generation.
@@ -642,6 +1391,115 @@ class QwenEditEditor:
         finally:
             self._empty_cuda_cache()
 
+    @staticmethod
+    def _generation_region_phrase(region: Any) -> str:
+        text = str(region or "").strip()
+        if not text or text == "main visible target":
+            return "from the target region"
+        if text.lower().startswith(
+            (
+                "on ",
+                "in ",
+                "at ",
+                "under ",
+                "beneath ",
+                "below ",
+                "above ",
+                "beside ",
+                "near ",
+                "next to ",
+                "left of ",
+                "right of ",
+                "in front of ",
+                "behind ",
+                "between ",
+                "attached to ",
+                "held by ",
+                "worn by ",
+                "around ",
+            )
+        ):
+            return text
+        return f"at {text}"
+
+    def _object_removal_instruction_variant(
+        self,
+        proposal: EditProposal,
+        candidate_index: int,
+    ) -> str:
+        variant_cfg = self.generation.get("object_removal_prompt_variants", {})
+        if isinstance(variant_cfg, dict) and not bool(variant_cfg.get("enabled", True)):
+            return proposal.instruction
+        spec = normalize_structured_edit(
+            proposal.structured_edit,
+            instruction=proposal.instruction,
+            family=proposal.definition.family,
+        )
+        if str(spec.get("edit_type", "")) != "object_removal":
+            return proposal.instruction
+        source_object = str(spec.get("source_object") or spec.get("target") or "").strip()
+        if not source_object:
+            return proposal.instruction
+        region_phrase = self._generation_region_phrase(spec.get("target_region"))
+        preserve_items = [
+            str(item).strip()
+            for item in spec.get("preserve", [])
+            if str(item).strip()
+        ][:3]
+        preserve_text = ", ".join(preserve_items) if preserve_items else "all unrelated content"
+        from_region = (
+            f"the area {region_phrase}"
+            if region_phrase.lower().startswith(
+                (
+                    "on ",
+                    "in ",
+                    "at ",
+                    "under ",
+                    "beneath ",
+                    "below ",
+                    "above ",
+                    "beside ",
+                    "near ",
+                    "next to ",
+                    "left of ",
+                    "right of ",
+                    "in front of ",
+                    "behind ",
+                    "between ",
+                    "attached to ",
+                    "held by ",
+                    "worn by ",
+                    "around ",
+                )
+            )
+            else region_phrase
+        )
+        variants = [
+            proposal.instruction,
+            (
+                f"Erase only the {source_object} {region_phrase}. Fill the empty area with natural "
+                f"surrounding texture. The {source_object} must be completely absent. Preserve {preserve_text}."
+            ),
+            (
+                f"Inpaint the area where the {source_object} appears {region_phrase}: remove the "
+                f"{source_object} entirely and replace it with matching background. Do not leave any visible "
+                f"{source_object} remnants. Preserve {preserve_text}."
+            ),
+            (
+                f"Delete the {source_object} {region_phrase}. No part of the {source_object} should remain "
+                f"visible after the edit. Keep the scene geometry, lighting, and {preserve_text} unchanged."
+            ),
+            (
+                f"Remove the {source_object} completely from {from_region} and naturally reconstruct the "
+                f"occluded background. Avoid duplicated edges, shadows, or fragments of the removed object."
+            ),
+            (
+                f"Make the edited image look as if the {source_object} was never present {region_phrase}. "
+                f"Use the surrounding scene to fill the region and preserve {preserve_text}."
+            ),
+        ]
+        return variants[candidate_index % len(variants)]
+
     def edit(self, record: UnlabeledImageRecord, proposal: EditProposal) -> Image.Image:
         image = Image.open(record.image_path).convert("RGB")
         return self.edit_image(image, proposal.instruction, proposal.definition.operation_id)
@@ -650,8 +1508,9 @@ class QwenEditEditor:
         image = Image.open(record.image_path).convert("RGB")
         original_seed = self.generation.get("seed")
         self.generation["seed"] = int(seed + candidate_index * 7919)
+        instruction = self._object_removal_instruction_variant(proposal, candidate_index)
         try:
-            return self.edit_image(image, proposal.instruction, proposal.definition.operation_id)
+            return self.edit_image(image, instruction, proposal.definition.operation_id)
         finally:
             if original_seed is None:
                 self.generation.pop("seed", None)
@@ -1906,6 +2765,16 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
     ) -> SolverResult:
         return self.score_group(proposal, original, [edited], editor=editor)[0]
 
+    def _apply_group_judge(
+        self,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited_candidates: list[Image.Image],
+        rows: list[dict[str, Any]],
+        editor: Any | None,
+    ) -> None:
+        return None
+
     def score_group(
         self,
         proposal: EditProposal,
@@ -1939,6 +2808,7 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
                         continue
                 rows.append(self._candidate_error_row(exc, candidate_index, "cuda"))
 
+        self._apply_group_judge(proposal, original, edited_candidates, rows, editor)
         ranked_rows = sorted(
             [row for row in rows if row["feasible"]],
             key=lambda row: row["reward"],
@@ -1976,6 +2846,7 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
                 "cepr_raw_reward": row["raw_reward"],
                 "cepr_reward": reward,
             }
+            component_scores.update(dict(row.get("component_scores", {})))
             outputs.append(
                 SolverResult(
                     global_score=row["edit_specificity"],
@@ -1987,6 +2858,2056 @@ class InternalContrastiveEditPreservationEvaluator(HardGatedRelativeEvaluator):
                 )
             )
         return outputs
+
+
+class InternalRubricCEPREvaluator(InternalContrastiveEditPreservationEvaluator):
+    """Rubric-grounded internal CEPR evaluator.
+
+    This keeps the CEPR reward internal-only, but scores explicit atomic edit
+    criteria from the structured proposal before allowing a candidate into SFT.
+    The rubric layer is deliberately decomposed: source grounding, required
+    after-state, forbidden old-state removal, preservation, and latent validity
+    are gated separately so a high prompt-gain scalar cannot compensate for a
+    semantically wrong edit.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        super().__init__(config)
+        self.rubric_source_threshold = float(config.get("rubric_source_threshold", 0.45))
+        self.rubric_required_threshold = float(config.get("rubric_required_threshold", 0.48))
+        self.rubric_forbidden_threshold = float(config.get("rubric_forbidden_threshold", 0.48))
+        self.rubric_preservation_threshold = float(config.get("rubric_preservation_threshold", 0.35))
+        self.rubric_reward_threshold = float(config.get("rubric_reward_threshold", self.reward_threshold))
+        self.rubric_gain_temperature = float(config.get("rubric_gain_temperature", 0.06))
+        self.rubric_abs_temperature = float(config.get("rubric_abs_temperature", 0.08))
+        self.rubric_preservation_temperature = float(config.get("rubric_preservation_temperature", 0.20))
+        self.rubric_support_center = float(config.get("rubric_support_center", 0.50))
+        self.rubric_forbidden_absence_center = float(config.get("rubric_forbidden_absence_center", 0.52))
+        self.min_required_gain = float(config.get("min_required_gain", 0.0))
+        self.min_forbidden_drop = float(config.get("min_forbidden_drop", 0.0))
+        self.max_rubric_items = int(config.get("max_rubric_items", 3))
+        self.combine_cepr_semantics = bool(config.get("combine_cepr_semantics", True))
+        self.rubric_soft_forbidden_edit_types = self._string_set(
+            config.get("rubric_soft_forbidden_edit_types", [])
+        )
+        self.rubric_hard_forbidden_edit_types = self._string_set(
+            config.get("rubric_hard_forbidden_edit_types", [])
+        )
+        self.rubric_hard_forbidden_threshold = float(
+            config.get("rubric_hard_forbidden_threshold", self.rubric_forbidden_threshold)
+        )
+        self.rubric_soft_forbidden_required_threshold = float(
+            config.get("rubric_soft_forbidden_required_threshold", self.rubric_required_threshold)
+        )
+        self.rubric_soft_forbidden_reward_threshold = float(
+            config.get("rubric_soft_forbidden_reward_threshold", self.rubric_reward_threshold)
+        )
+        self.rubric_soft_forbidden_preservation_threshold = float(
+            config.get("rubric_soft_forbidden_preservation_threshold", self.rubric_preservation_threshold)
+        )
+        self.object_detector_enabled = bool(config.get("object_detector_enabled", False))
+        self.object_detector_edit_types = self._string_set(
+            config.get("object_detector_edit_types", ["object_removal", "object_replacement"])
+        )
+        self.object_detector_model_id = str(config.get("object_detector_model_id", "IDEA-Research/grounding-dino-tiny"))
+        self.object_detector_device = str(config.get("object_detector_device", "auto"))
+        self.object_detector_torch_dtype = str(config.get("object_detector_torch_dtype", "auto"))
+        self.object_detector_box_threshold = float(config.get("object_detector_box_threshold", 0.25))
+        self.object_detector_text_threshold = float(config.get("object_detector_text_threshold", 0.20))
+        self.object_detector_original_min_score = float(config.get("object_detector_original_min_score", 0.20))
+        self.object_detector_edited_absent_max_score = float(config.get("object_detector_edited_absent_max_score", 0.12))
+        self.object_detector_absent_ratio = float(config.get("object_detector_absent_ratio", 0.55))
+        self.object_detector_target_min_score = float(config.get("object_detector_target_min_score", 0.20))
+        self.object_detector_score_threshold = float(config.get("object_detector_score_threshold", 0.50))
+        self.object_detector_score_temperature = float(config.get("object_detector_score_temperature", 0.05))
+        self.object_detector_require_original_detection = bool(
+            config.get("object_detector_require_original_detection", True)
+        )
+        self._object_detector_model = None
+        self._object_detector_processor = None
+        self._object_detector_device_resolved = None
+        self.conservative_region_reward_enabled = bool(
+            config.get("conservative_region_reward_enabled", False)
+        )
+        self.conservative_region_edit_types = self._string_set(
+            config.get(
+                "conservative_region_edit_types",
+                [
+                    "object_removal",
+                    "object_replacement",
+                    "color_change",
+                    "attribute_change",
+                    "material_change",
+                    "local_enhancement",
+                ],
+            )
+        )
+        self.conservative_region_require_mask_edit_types = self._string_set(
+            config.get(
+                "conservative_region_require_mask_edit_types",
+                ["object_removal", "object_replacement"],
+            )
+        )
+        self.conservative_region_use_object_detector = bool(
+            config.get("conservative_region_use_object_detector", True)
+        )
+        self.conservative_region_fallback_to_diff_mask = bool(
+            config.get("conservative_region_fallback_to_diff_mask", True)
+        )
+        self.conservative_region_diff_fallback_allows_gate = bool(
+            config.get("conservative_region_diff_fallback_allows_gate", False)
+        )
+        self.conservative_region_mask_size = int(config.get("conservative_region_mask_size", 128))
+        self.conservative_region_mask_padding_fraction = float(
+            config.get("conservative_region_mask_padding_fraction", 0.04)
+        )
+        self.conservative_region_diff_threshold = int(config.get("conservative_region_diff_threshold", 18))
+        self.conservative_region_diff_dilation_radius = int(
+            config.get("conservative_region_diff_dilation_radius", 1)
+        )
+        self.conservative_region_min_target_area = float(
+            config.get("conservative_region_min_target_area", 0.0025)
+        )
+        self.conservative_region_max_target_area = float(
+            config.get("conservative_region_max_target_area", 0.65)
+        )
+        self.conservative_region_max_detector_boxes = int(
+            config.get("conservative_region_max_detector_boxes", 3)
+        )
+        self.conservative_region_min_target_change = float(
+            config.get("conservative_region_min_target_change", 0.025)
+        )
+        self.conservative_region_min_target_change_score = float(
+            config.get("conservative_region_min_target_change_score", 0.40)
+        )
+        self.conservative_region_target_change_temperature = float(
+            config.get("conservative_region_target_change_temperature", 0.025)
+        )
+        self.conservative_region_max_outside_change = float(
+            config.get("conservative_region_max_outside_change", 0.055)
+        )
+        self.conservative_region_outside_change_temperature = float(
+            config.get("conservative_region_outside_change_temperature", 0.030)
+        )
+        self.conservative_region_max_outside_changed_fraction = float(
+            config.get("conservative_region_max_outside_changed_fraction", 0.35)
+        )
+        self.conservative_region_min_localization_precision = float(
+            config.get("conservative_region_min_localization_precision", 0.35)
+        )
+        self.conservative_region_min_outside_preservation = float(
+            config.get("conservative_region_min_outside_preservation", 0.55)
+        )
+        self.conservative_region_min_reward = float(
+            config.get("conservative_region_min_reward", 0.35)
+        )
+        judge_cfg = config.get("internal_vlm_judge", {})
+        self.internal_vlm_judge_cfg = dict(judge_cfg) if isinstance(judge_cfg, dict) else {}
+        self.internal_vlm_judge_enabled = bool(self.internal_vlm_judge_cfg.get("enabled", False))
+        self.internal_vlm_judge_max_candidates = int(self.internal_vlm_judge_cfg.get("max_candidates", 8))
+        self.internal_vlm_judge_image_resolution = int(self.internal_vlm_judge_cfg.get("image_resolution", 384))
+        self.internal_vlm_judge_max_new_tokens = int(self.internal_vlm_judge_cfg.get("max_new_tokens", 768))
+        self.internal_vlm_judge_temperature = float(self.internal_vlm_judge_cfg.get("temperature", 0.0))
+        self.internal_vlm_judge_top_p = float(self.internal_vlm_judge_cfg.get("top_p", 0.9))
+        self.internal_vlm_judge_cepr_weight = float(self.internal_vlm_judge_cfg.get("cepr_weight", 0.45))
+        self.internal_vlm_judge_weight = float(self.internal_vlm_judge_cfg.get("judge_weight", 0.55))
+        self.internal_vlm_judge_min_score = float(self.internal_vlm_judge_cfg.get("min_score_for_feasible", 0.35))
+        self.internal_vlm_judge_min_semantic = float(
+            self.internal_vlm_judge_cfg.get("min_semantic_for_feasible", self.internal_vlm_judge_min_score)
+        )
+        self.internal_vlm_judge_min_preservation = float(
+            self.internal_vlm_judge_cfg.get("min_preservation_for_feasible", self.internal_vlm_judge_min_score)
+        )
+        self.internal_vlm_judge_min_artifact_free = float(
+            self.internal_vlm_judge_cfg.get("min_artifact_free_for_feasible", self.internal_vlm_judge_min_score)
+        )
+        self.internal_vlm_judge_min_confidence = float(self.internal_vlm_judge_cfg.get("min_confidence", 0.25))
+        self.internal_vlm_judge_require_for_feasible = bool(
+            self.internal_vlm_judge_cfg.get("require_for_feasible", False)
+        )
+        self.internal_vlm_judge_fail_open = bool(self.internal_vlm_judge_cfg.get("fail_open", True))
+        self.internal_vlm_judge_fail_closed_on_low_score = bool(
+            self.internal_vlm_judge_cfg.get("fail_closed_on_low_score", True)
+        )
+        self.internal_vlm_judge_missing_is_failure = bool(
+            self.internal_vlm_judge_cfg.get("missing_score_is_failure", not self.internal_vlm_judge_fail_open)
+        )
+        self.internal_vlm_judge_require_confidence_for_feasible = bool(
+            self.internal_vlm_judge_cfg.get("require_confidence_for_feasible", False)
+        )
+        self.internal_vlm_judge_use_unreliable_scores = bool(
+            self.internal_vlm_judge_cfg.get("use_unreliable_scores", True)
+        )
+        self.internal_vlm_judge_mode = str(self.internal_vlm_judge_cfg.get("mode", "per_candidate")).strip().lower()
+        if self.internal_vlm_judge_mode not in {"per_candidate", "group"}:
+            self.internal_vlm_judge_mode = "per_candidate"
+
+    @staticmethod
+    def _unique_texts(items: list[Any], max_items: int) -> list[str]:
+        output: list[str] = []
+        seen = set()
+        for item in items:
+            text = str(item).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(text)
+            if len(output) >= max_items:
+                break
+        return output
+
+    @staticmethod
+    def _string_set(value: Any) -> set[str]:
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            raw_items = [part.strip() for part in value.split(",")]
+        else:
+            raw_items = [str(item).strip() for item in value]
+        return {item for item in raw_items if item}
+
+    @staticmethod
+    def _weighted_geometric_blend(value_a: float, weight_a: float, value_b: float, weight_b: float) -> float:
+        value_a = _clamp(value_a)
+        value_b = _clamp(value_b)
+        weight_a = max(float(weight_a), 0.0)
+        weight_b = max(float(weight_b), 0.0)
+        total_weight = weight_a + weight_b
+        if total_weight <= 0.0:
+            return value_a
+        eps = 1.0e-6
+        blended = math.exp(
+            (weight_a * math.log(max(value_a, eps)) + weight_b * math.log(max(value_b, eps)))
+            / total_weight
+        )
+        return _clamp(blended)
+
+    @staticmethod
+    def _normalize_judge_score(value: Any, default: float = 0.5) -> float:
+        score = _finite_float(value, math.nan)
+        if not math.isfinite(score):
+            return default
+        if score > 10.0:
+            return _clamp(score / 100.0)
+        if score > 5.0:
+            return _clamp(score / 10.0)
+        if score > 1.0:
+            return _clamp((score - 1.0) / 4.0)
+        return _clamp(score)
+
+    @staticmethod
+    def _parse_judge_candidate_index(value: Any, default: int = -1) -> int:
+        parsed = _finite_float(value, math.nan)
+        if math.isfinite(parsed):
+            return int(parsed)
+        match = re.search(r"\d+", str(value or ""))
+        return int(match.group(0)) if match else default
+
+    def _resize_for_internal_vlm_judge(self, image: Image.Image) -> Image.Image:
+        image = image.convert("RGB")
+        max_side = max(64, self.internal_vlm_judge_image_resolution)
+        width, height = image.size
+        scale = min(1.0, max_side / max(width, height))
+        if scale >= 1.0:
+            return image.copy()
+        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        return image.resize(new_size, Image.Resampling.BICUBIC)
+
+    def _internal_vlm_judge_prompt(
+        self,
+        proposal: EditProposal,
+        candidate_indices: list[int],
+    ) -> str:
+        spec = normalize_structured_edit(
+            proposal.structured_edit,
+            instruction=proposal.instruction,
+            family=proposal.definition.family,
+        )
+        candidate_lines = "\n".join(
+            f"- Candidate {candidate_index}: edited image shown after the original."
+            for candidate_index in candidate_indices
+        )
+        spec_json = json.dumps(spec, ensure_ascii=True, sort_keys=True)
+        candidate_index_json = json.dumps(candidate_indices)
+        schema_json = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "candidate_index": candidate_index,
+                        "instruction_following": None,
+                        "edit_success": None,
+                        "target_correctness": None,
+                        "preservation": None,
+                        "artifact_free": None,
+                        "overall": None,
+                        "confidence": None,
+                        "source_object_visible_before": None,
+                        "object_visible_after": None,
+                        "object_absence": None,
+                        "fill_naturalness": None,
+                        "reason": "short visual reason",
+                    }
+                    for candidate_index in candidate_indices
+                ],
+                "best_candidate_index": candidate_indices[0] if candidate_indices else 0,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        return (
+            "You are Qwen-Image-Edit's internal multimodal self-judge. Compare each edited candidate "
+            "against the original image and the requested edit. Use only visual evidence in the images. "
+            "Do not reward candidates that merely look plausible if they fail the requested edit.\n\n"
+            f"Instruction: {proposal.instruction}\n"
+            f"Structured edit: {spec_json}\n\n"
+            "Each image is introduced by a text label immediately before the image. "
+            "The original image is only for comparison; when scoring a candidate, judge the edited "
+            "candidate image after applying the instruction, not the original image.\n"
+            f"{candidate_lines}\n\n"
+            f"Required candidate indices: {candidate_index_json}. You must return exactly one scored JSON object "
+            "for every required candidate index, including failed or low-quality candidates. Do not omit any "
+            "candidate.\n\n"
+            "For each candidate, score these fields from 0.0 to 1.0:\n"
+            "- instruction_following: requested edit is actually performed.\n"
+            "- edit_success: target object/attribute/location/style after-state is correct.\n"
+            "- target_correctness: edited target and target region match the structured edit.\n"
+            "- preservation: unrelated source content, identity, layout, and viewpoint are preserved.\n"
+            "- artifact_free: no obvious artifacts, distortions, duplicated objects, or broken text.\n"
+            "- overall: your final visual edit quality score.\n"
+            "- confidence: confidence in your judgment.\n\n"
+            "For object_removal edits, also score these fields from 0.0 to 1.0:\n"
+            "- source_object_visible_before: the requested source object is visible in the original image.\n"
+            "- object_visible_after: the requested source object or its remnants are still visible in the edited image; 1.0 means clearly still visible and 0.0 means absent.\n"
+            "- object_absence: the requested source object is absent from the edited image; 1.0 means fully removed.\n"
+            "- fill_naturalness: the removed region is naturally filled with surrounding image content.\n"
+            "For object_removal, a candidate with object_visible_after above 0.2 should receive low "
+            "instruction_following, edit_success, target_correctness, object_absence, and overall scores. "
+            "If the requested object is still visible after editing, set object_visible_after close to 1.0 "
+            "and object_absence close to 0.0.\n\n"
+            "Return JSON only, with this exact shape and the required indices:\n"
+            f"{schema_json}\n"
+            "Replace every null placeholder with a numeric float from 0.0 to 1.0. Do not return null values."
+        )
+
+    @staticmethod
+    def _judge_reason_says_object_removal_failed(reason: str) -> bool:
+        text = str(reason or "").lower()
+        if not text:
+            return False
+        failure_patterns = [
+            r"\bstill\s+(?:clearly\s+)?(?:visible|present|there)\b",
+            r"\bremains?\s+(?:clearly\s+)?(?:visible|present|there)?\b",
+            r"\bremaining\s+(?:object|part|remnant|piece|portion)\b",
+            r"\bnot\s+(?:removed|absent|erased|deleted|fully removed|completely removed)\b",
+            r"\bfailed\s+to\s+(?:remove|erase|delete)\b",
+            r"\bcontinues?\s+to\s+(?:be\s+)?(?:visible|appear)\b",
+        ]
+        return any(re.search(pattern, text) for pattern in failure_patterns)
+
+    def _parse_internal_vlm_judge_output(
+        self,
+        decoded: str,
+        candidate_indices: set[int],
+    ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+        parsed = extract_json_object(decoded)
+        if parsed is None:
+            raise ValueError(f"Qwen-VL judge did not return parseable JSON: {decoded[:500]}")
+        raw_candidates = parsed.get("candidates", [])
+        if isinstance(raw_candidates, dict):
+            indexed_candidates = []
+            for raw_index, raw_value in raw_candidates.items():
+                if not isinstance(raw_value, dict):
+                    continue
+                item = dict(raw_value)
+                item.setdefault("candidate_index", raw_index)
+                indexed_candidates.append(item)
+            raw_candidates = indexed_candidates
+        if not isinstance(raw_candidates, list):
+            raise ValueError("Qwen-VL judge JSON is missing a candidates list.")
+
+        scores_by_index: dict[int, dict[str, Any]] = {}
+        for raw_item in raw_candidates:
+            if not isinstance(raw_item, dict):
+                continue
+            candidate_index = self._parse_judge_candidate_index(raw_item.get("candidate_index"))
+            if candidate_index not in candidate_indices and len(candidate_indices) == 1:
+                candidate_index = next(iter(candidate_indices))
+            if candidate_index not in candidate_indices:
+                continue
+            instruction_following = self._normalize_judge_score(raw_item.get("instruction_following"))
+            edit_success = self._normalize_judge_score(raw_item.get("edit_success"))
+            target_correctness = self._normalize_judge_score(raw_item.get("target_correctness"), edit_success)
+            preservation = self._normalize_judge_score(raw_item.get("preservation"))
+            artifact_free = self._normalize_judge_score(raw_item.get("artifact_free"))
+            overall = self._normalize_judge_score(raw_item.get("overall"))
+            confidence = self._normalize_judge_score(raw_item.get("confidence"), default=0.0)
+            missing_fields = [
+                field
+                for field in (
+                    "instruction_following",
+                    "edit_success",
+                    "target_correctness",
+                    "preservation",
+                    "artifact_free",
+                    "overall",
+                    "confidence",
+                    "source_object_visible_before",
+                    "object_visible_after",
+                    "object_absence",
+                    "fill_naturalness",
+                )
+                if raw_item.get(field) is None
+            ]
+            source_object_visible_before = self._normalize_judge_score(
+                raw_item.get("source_object_visible_before"),
+                default=1.0,
+            )
+            object_visible_after = self._normalize_judge_score(
+                raw_item.get("object_visible_after"),
+                default=1.0 - edit_success,
+            )
+            object_absence = self._normalize_judge_score(
+                raw_item.get("object_absence"),
+                default=1.0 - object_visible_after,
+            )
+            fill_naturalness = self._normalize_judge_score(
+                raw_item.get("fill_naturalness"),
+                default=target_correctness,
+            )
+            semantic = self._geometric_mean([instruction_following, edit_success, target_correctness])
+            score = self._geometric_mean([semantic, preservation, artifact_free, overall])
+            scores_by_index[candidate_index] = {
+                "instruction_following": instruction_following,
+                "edit_success": edit_success,
+                "target_correctness": target_correctness,
+                "semantic": semantic,
+                "preservation": preservation,
+                "artifact_free": artifact_free,
+                "overall": overall,
+                "confidence": confidence,
+                "source_object_visible_before": source_object_visible_before,
+                "object_visible_after": object_visible_after,
+                "object_absence": object_absence,
+                "fill_naturalness": fill_naturalness,
+                "score": score,
+                "reason": str(raw_item.get("reason", ""))[:240],
+                "missing_fields": missing_fields,
+            }
+        if not scores_by_index:
+            raise ValueError("Qwen-VL judge JSON contained no candidate scores matching this group.")
+        best_candidate_index = parsed.get("best_candidate_index")
+        if best_candidate_index is not None:
+            best_candidate_index = self._parse_judge_candidate_index(best_candidate_index)
+            if best_candidate_index not in candidate_indices:
+                best_candidate_index = None
+        return scores_by_index, {
+            "best_candidate_index": best_candidate_index,
+            "raw_text_preview": decoded[:500],
+        }
+
+    @staticmethod
+    def _missing_internal_vlm_judge_score(candidate_index: int, reason: str) -> dict[str, Any]:
+        return {
+            "instruction_following": 0.0,
+            "edit_success": 0.0,
+            "target_correctness": 0.0,
+            "semantic": 1.0e-6,
+            "preservation": 0.0,
+            "artifact_free": 0.0,
+            "overall": 0.0,
+            "confidence": 0.0,
+            "source_object_visible_before": 0.0,
+            "object_visible_after": 1.0,
+            "object_absence": 0.0,
+            "fill_naturalness": 0.0,
+            "score": 1.0e-6,
+            "reason": reason[:240],
+            "missing_fallback": True,
+            "candidate_index": candidate_index,
+        }
+
+    def _generate_internal_vlm_judge_text(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        candidate_items: list[tuple[int, Image.Image]],
+    ) -> str:
+        if getattr(pipe, "processor", None) is None or getattr(pipe, "text_encoder", None) is None:
+            raise ValueError("Qwen-VL judge requires a pipeline with processor and text_encoder.")
+        model = pipe.text_encoder
+        processor = pipe.processor
+        if not hasattr(model, "generate") or not hasattr(processor, "apply_chat_template"):
+            raise ValueError("Qwen-VL judge requires a generative Qwen text_encoder and chat processor.")
+
+        candidate_indices = [candidate_index for candidate_index, _ in candidate_items]
+        prompt = self._internal_vlm_judge_prompt(proposal, candidate_indices)
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": "Original image:"},
+            {"type": "image", "image": "original"},
+        ]
+        images = [self._resize_for_internal_vlm_judge(original)]
+        for candidate_index, image in candidate_items:
+            content.extend(
+                [
+                    {"type": "text", "text": f"Edited candidate {candidate_index}:"},
+                    {"type": "image", "image": f"candidate_{candidate_index}"},
+                ]
+            )
+            images.append(self._resize_for_internal_vlm_judge(image))
+        content.append({"type": "text", "text": prompt})
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict image-editing evaluator. Return compact JSON only; "
+                    "do not include markdown or prose outside JSON."
+                ),
+            },
+            {"role": "user", "content": content},
+        ]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        device = getattr(model, "device", None)
+        if device is None:
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                device = getattr(pipe, "device", "cpu")
+        inputs = processor(text=[text], images=images, padding=True, return_tensors="pt")
+        inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
+        do_sample = self.internal_vlm_judge_temperature > 0.0
+        generation_kwargs = {
+            **inputs,
+            "max_new_tokens": self.internal_vlm_judge_max_new_tokens,
+            "do_sample": do_sample,
+        }
+        if do_sample:
+            generation_kwargs["temperature"] = self.internal_vlm_judge_temperature
+            generation_kwargs["top_p"] = self.internal_vlm_judge_top_p
+        import torch
+
+        with torch.no_grad():
+            output_ids = model.generate(**generation_kwargs)
+        generated = output_ids[:, inputs["input_ids"].shape[1] :]
+        return processor.batch_decode(generated, skip_special_tokens=True)[0]
+
+    def _run_internal_vlm_judge(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        candidate_items: list[tuple[int, Image.Image]],
+    ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+        candidate_indices = [candidate_index for candidate_index, _ in candidate_items]
+        if self.internal_vlm_judge_mode == "per_candidate" and len(candidate_items) > 1:
+            scores_by_index: dict[int, dict[str, Any]] = {}
+            fallback_errors: dict[int, str] = {}
+            raw_previews: dict[int, str] = {}
+            for candidate_index, image in candidate_items:
+                try:
+                    decoded = self._generate_internal_vlm_judge_text(
+                        pipe,
+                        proposal,
+                        original,
+                        [(candidate_index, image)],
+                    )
+                    raw_previews[candidate_index] = decoded[:240]
+                    single_scores, _ = self._parse_internal_vlm_judge_output(decoded, {candidate_index})
+                    if candidate_index in single_scores:
+                        scores_by_index[candidate_index] = single_scores[candidate_index]
+                        continue
+                except Exception as exc:
+                    fallback_errors[candidate_index] = f"{exc.__class__.__name__}: {str(exc)[:160]}"
+                scores_by_index[candidate_index] = self._missing_internal_vlm_judge_score(
+                    candidate_index,
+                    "Internal VLM judge failed to score this candidate in per-candidate mode; assigning a conservative low-confidence score.",
+                )
+            best_candidate_index = max(
+                scores_by_index,
+                key=lambda index: float(scores_by_index[index].get("score", 0.0)),
+            ) if scores_by_index else None
+            return scores_by_index, {
+                "best_candidate_index": best_candidate_index,
+                "raw_text_preview": json.dumps(raw_previews, ensure_ascii=True)[:500],
+                "judge_mode": "per_candidate",
+                "missing_candidate_indices": [
+                    index for index, score in scores_by_index.items() if score.get("missing_fallback")
+                ],
+                "fallback_candidate_indices": [
+                    index for index, score in scores_by_index.items() if score.get("missing_fallback")
+                ],
+                "fallback_errors": fallback_errors,
+            }
+        decoded = self._generate_internal_vlm_judge_text(pipe, proposal, original, candidate_items)
+        scores_by_index, summary = self._parse_internal_vlm_judge_output(decoded, set(candidate_indices))
+        missing_indices = [candidate_index for candidate_index in candidate_indices if candidate_index not in scores_by_index]
+        fallback_indices: list[int] = []
+        fallback_errors: dict[int, str] = {}
+        candidate_item_by_index = dict(candidate_items)
+        for candidate_index in missing_indices:
+            image = candidate_item_by_index.get(candidate_index)
+            if image is None:
+                continue
+            try:
+                single_decoded = self._generate_internal_vlm_judge_text(
+                    pipe,
+                    proposal,
+                    original,
+                    [(candidate_index, image)],
+                )
+                single_scores, _ = self._parse_internal_vlm_judge_output(single_decoded, {candidate_index})
+                if candidate_index in single_scores:
+                    scores_by_index[candidate_index] = single_scores[candidate_index]
+                    fallback_indices.append(candidate_index)
+                    continue
+            except Exception as exc:
+                fallback_errors[candidate_index] = f"{exc.__class__.__name__}: {str(exc)[:160]}"
+            scores_by_index[candidate_index] = self._missing_internal_vlm_judge_score(
+                candidate_index,
+                "Internal VLM judge omitted this candidate after fallback; assigning a conservative low-confidence score.",
+            )
+            fallback_indices.append(candidate_index)
+        summary["missing_candidate_indices"] = missing_indices
+        summary["fallback_candidate_indices"] = fallback_indices
+        summary["fallback_errors"] = fallback_errors
+        return scores_by_index, summary
+
+    def _apply_group_judge(
+        self,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited_candidates: list[Image.Image],
+        rows: list[dict[str, Any]],
+        editor: Any | None,
+    ) -> None:
+        if not self.internal_vlm_judge_enabled or not rows:
+            return
+        candidate_rows = sorted(
+            rows,
+            key=lambda row: (
+                1.0 if row.get("feasible") else 0.0,
+                _finite_float(row.get("raw_reward")),
+                _finite_float(row.get("reward")),
+            ),
+            reverse=True,
+        )
+        candidate_rows = candidate_rows[: max(1, self.internal_vlm_judge_max_candidates)]
+        candidate_items = [
+            (int(row["candidate_index"]), edited_candidates[int(row["candidate_index"])])
+            for row in candidate_rows
+            if 0 <= int(row["candidate_index"]) < len(edited_candidates)
+        ]
+        if not candidate_items:
+            return
+        try:
+            if hasattr(editor, "prepare_for_internal_scoring"):
+                editor.prepare_for_internal_scoring()
+            pipe = self._get_internal_pipe(editor)
+            judge_scores, judge_summary = self._run_internal_vlm_judge(
+                pipe,
+                proposal,
+                original,
+                candidate_items,
+            )
+        except Exception as exc:
+            for row in rows:
+                signals = row.setdefault("signals", {})
+                signals["internal_vlm_judge_supported"] = 0.0
+                signals["internal_vlm_judge_error"] = 1.0
+                signals["internal_vlm_judge_error_type"] = exc.__class__.__name__
+                signals["internal_vlm_judge_error_message"] = str(exc)[:500]
+                if not self.internal_vlm_judge_fail_open:
+                    row["feasible"] = False
+                    row["reward"] = 0.0
+            return
+
+        best_candidate_index = judge_summary.get("best_candidate_index")
+        missing_candidate_indices = set(judge_summary.get("missing_candidate_indices") or [])
+        fallback_candidate_indices = set(judge_summary.get("fallback_candidate_indices") or [])
+        fallback_errors = judge_summary.get("fallback_errors") or {}
+        spec = normalize_structured_edit(
+            proposal.structured_edit,
+            instruction=proposal.instruction,
+            family=proposal.definition.family,
+        )
+        edit_type = str(spec.get("edit_type", "local_enhancement"))
+        for row in rows:
+            candidate_index = int(row["candidate_index"])
+            signals = row.setdefault("signals", {})
+            component_scores = row.setdefault("component_scores", {})
+            if candidate_index not in judge_scores:
+                signals["internal_vlm_judge_supported"] = 0.0
+                signals["internal_vlm_judge_missing_from_group"] = 1.0
+                if self.internal_vlm_judge_require_for_feasible or not self.internal_vlm_judge_fail_open:
+                    row["feasible"] = False
+                    row["reward"] = 0.0
+                    signals["rubric_reject_reason"] = "internal_vlm_judge_missing"
+                continue
+            score = judge_scores[candidate_index]
+            missing_fallback = bool(score.get("missing_fallback", False))
+            judge_score = float(score["score"])
+            judge_semantic = float(score["semantic"])
+            judge_preservation = float(score["preservation"])
+            judge_artifact_free = float(score["artifact_free"])
+            judge_confidence = float(score["confidence"])
+            judge_source_visible_before = float(score.get("source_object_visible_before", 1.0))
+            judge_object_visible_after = float(score.get("object_visible_after", 1.0 - judge_semantic))
+            judge_object_absence = float(score.get("object_absence", 1.0 - judge_object_visible_after))
+            judge_fill_naturalness = float(score.get("fill_naturalness", score.get("target_correctness", judge_semantic)))
+            raw_judge_object_visible_after = judge_object_visible_after
+            raw_judge_object_absence = judge_object_absence
+            object_removal_reason_failed = False
+            object_removal_field_pass = True
+            object_removal_source_visible_pass = True
+            object_removal_visibility_pass = True
+            object_removal_gate_pass = True
+            if edit_type == "object_removal":
+                object_removal_reason_failed = self._judge_reason_says_object_removal_failed(
+                    str(score.get("reason", ""))
+                )
+                missing_object_fields = {
+                    "source_object_visible_before",
+                    "object_visible_after",
+                    "object_absence",
+                    "fill_naturalness",
+                }.intersection(set(score.get("missing_fields") or []))
+                object_removal_field_pass = not missing_object_fields
+                judge_object_visible_after = _clamp(judge_object_visible_after)
+                judge_object_absence = _clamp(judge_object_absence)
+                judge_fill_naturalness = _clamp(judge_fill_naturalness)
+                judge_source_visible_before = _clamp(judge_source_visible_before)
+                object_removal_source_visible_pass = judge_source_visible_before >= 0.5
+                effective_object_absence = min(judge_object_absence, _clamp(1.0 - judge_object_visible_after))
+                object_removal_visibility_pass = (
+                    judge_object_visible_after <= 0.2 and effective_object_absence >= 0.8
+                )
+                object_removal_gate_pass = (
+                    object_removal_field_pass
+                    and object_removal_source_visible_pass
+                    and object_removal_visibility_pass
+                )
+                object_not_visible_after = _clamp(1.0 - judge_object_visible_after)
+                judge_semantic = self._geometric_mean(
+                    [
+                        judge_semantic,
+                        judge_source_visible_before,
+                        effective_object_absence,
+                        object_not_visible_after,
+                        judge_fill_naturalness,
+                    ]
+                )
+                judge_score = self._geometric_mean(
+                    [
+                        judge_semantic,
+                        judge_preservation,
+                        judge_artifact_free,
+                        float(score["overall"]),
+                    ]
+                )
+            pre_judge_reward = _finite_float(row.get("reward"))
+            pre_judge_raw_reward = _finite_float(row.get("raw_reward"))
+            pre_judge_semantic = _finite_float(row.get("semantic_edit"))
+            judge_supported = not missing_fallback
+            judge_reliable = (not missing_fallback) and judge_confidence >= self.internal_vlm_judge_min_confidence
+            judge_low_score = judge_supported and (
+                judge_score < self.internal_vlm_judge_min_score
+                or judge_semantic < self.internal_vlm_judge_min_semantic
+                or judge_preservation < self.internal_vlm_judge_min_preservation
+                or judge_artifact_free < self.internal_vlm_judge_min_artifact_free
+            )
+            if edit_type == "object_removal" and not object_removal_gate_pass:
+                judge_low_score = True
+            confidence_pass = (
+                judge_confidence >= self.internal_vlm_judge_min_confidence
+                or not self.internal_vlm_judge_require_confidence_for_feasible
+            )
+            judge_pass = judge_supported and not judge_low_score and confidence_pass
+            use_judge_for_reward = judge_supported and (
+                judge_reliable or self.internal_vlm_judge_use_unreliable_scores or judge_low_score
+            )
+            if use_judge_for_reward:
+                combined_raw_reward = self._weighted_geometric_blend(
+                    pre_judge_raw_reward,
+                    self.internal_vlm_judge_cepr_weight,
+                    judge_score,
+                    self.internal_vlm_judge_weight,
+                )
+                combined_semantic = self._weighted_geometric_blend(
+                    pre_judge_semantic,
+                    self.internal_vlm_judge_cepr_weight,
+                    judge_semantic,
+                    self.internal_vlm_judge_weight,
+                )
+            else:
+                combined_raw_reward = pre_judge_raw_reward
+                combined_semantic = pre_judge_semantic
+            judge_hard_fail = (
+                (missing_fallback and self.internal_vlm_judge_missing_is_failure)
+                or (judge_low_score and self.internal_vlm_judge_fail_closed_on_low_score)
+                or (self.internal_vlm_judge_require_for_feasible and not judge_pass)
+            )
+            combined_reward_pass = combined_raw_reward >= self.reward_threshold
+            component_scores.update(
+                {
+                    "cepr_pre_vlm_reward": pre_judge_reward,
+                    "cepr_pre_vlm_raw_reward": pre_judge_raw_reward,
+                    "cepr_pre_vlm_semantic_edit": pre_judge_semantic,
+                    "internal_vlm_judge_score": judge_score,
+                    "internal_vlm_judge_semantic": judge_semantic,
+                    "internal_vlm_judge_instruction_following": float(score["instruction_following"]),
+                    "internal_vlm_judge_edit_success": float(score["edit_success"]),
+                    "internal_vlm_judge_target_correctness": float(score["target_correctness"]),
+                    "internal_vlm_judge_preservation": judge_preservation,
+                    "internal_vlm_judge_artifact_free": judge_artifact_free,
+                    "internal_vlm_judge_overall": float(score["overall"]),
+                    "internal_vlm_judge_confidence": judge_confidence,
+                    "internal_vlm_judge_source_object_visible_before": judge_source_visible_before,
+                    "internal_vlm_judge_object_visible_after": judge_object_visible_after,
+                    "internal_vlm_judge_object_absence": judge_object_absence,
+                    "internal_vlm_judge_fill_naturalness": judge_fill_naturalness,
+                    "internal_vlm_judge_raw_object_visible_after": raw_judge_object_visible_after,
+                    "internal_vlm_judge_raw_object_absence": raw_judge_object_absence,
+                    "internal_vlm_judge_combined_raw_reward": combined_raw_reward,
+                }
+            )
+            signals.update(
+                {
+                    "internal_vlm_judge_supported": 0.0 if missing_fallback else 1.0,
+                    "internal_vlm_judge_pass": 1.0 if judge_pass else 0.0,
+                    "internal_vlm_judge_best": 1.0 if candidate_index == best_candidate_index else 0.0,
+                    "internal_vlm_judge_missing_from_group": (
+                        1.0 if candidate_index in missing_candidate_indices else 0.0
+                    ),
+                    "internal_vlm_judge_fallback_used": (
+                        1.0 if candidate_index in fallback_candidate_indices else 0.0
+                    ),
+                    "internal_vlm_judge_missing_fallback": 1.0 if missing_fallback else 0.0,
+                    "internal_vlm_judge_reliable": 1.0 if judge_reliable else 0.0,
+                    "internal_vlm_judge_low_confidence_ignored": (
+                        1.0 if judge_supported and not judge_reliable and not use_judge_for_reward else 0.0
+                    ),
+                    "internal_vlm_judge_used_for_reward": 1.0 if use_judge_for_reward else 0.0,
+                    "internal_vlm_judge_low_score": 1.0 if judge_low_score else 0.0,
+                    "internal_vlm_judge_hard_fail": 1.0 if judge_hard_fail else 0.0,
+                    "internal_vlm_judge_object_removal_specific": 1.0 if edit_type == "object_removal" else 0.0,
+                    "internal_vlm_judge_object_removal_gate_pass": (
+                        1.0 if object_removal_gate_pass else 0.0
+                    ),
+                    "internal_vlm_judge_object_removal_source_visible_pass": (
+                        1.0 if object_removal_source_visible_pass else 0.0
+                    ),
+                    "internal_vlm_judge_object_removal_visibility_pass": (
+                        1.0 if object_removal_visibility_pass else 0.0
+                    ),
+                    "internal_vlm_judge_object_removal_reason_failed": (
+                        1.0 if object_removal_reason_failed else 0.0
+                    ),
+                    "internal_vlm_judge_missing_field_count": float(len(score.get("missing_fields") or [])),
+                    "internal_vlm_judge_combined_reward_gate_pass": 1.0 if combined_reward_pass else 0.0,
+                    "internal_vlm_judge_min_score": self.internal_vlm_judge_min_score,
+                    "internal_vlm_judge_min_semantic": self.internal_vlm_judge_min_semantic,
+                    "internal_vlm_judge_min_preservation": self.internal_vlm_judge_min_preservation,
+                    "internal_vlm_judge_min_artifact_free": self.internal_vlm_judge_min_artifact_free,
+                    "internal_vlm_judge_min_confidence": self.internal_vlm_judge_min_confidence,
+                    "internal_vlm_judge_require_for_feasible": 1.0 if self.internal_vlm_judge_require_for_feasible else 0.0,
+                    "internal_vlm_judge_require_confidence_for_feasible": (
+                        1.0 if self.internal_vlm_judge_require_confidence_for_feasible else 0.0
+                    ),
+                    "internal_vlm_judge_reason": score["reason"],
+                }
+            )
+            if candidate_index in fallback_errors:
+                signals["internal_vlm_judge_fallback_error"] = fallback_errors[candidate_index]
+            row["semantic_edit"] = combined_semantic
+            row["raw_reward"] = combined_raw_reward
+            if (
+                row.get("feasible")
+                and combined_reward_pass
+                and not judge_hard_fail
+            ):
+                row["reward"] = combined_raw_reward
+            elif row.get("feasible"):
+                row["feasible"] = False
+                row["reward"] = 0.0
+                if judge_hard_fail:
+                    signals["rubric_reject_reason"] = "internal_vlm_judge_hard_fail"
+                else:
+                    signals["rubric_reject_reason"] = "internal_vlm_judge_reward"
+                signals["rubric_gate_internal_vlm_judge_pass"] = 0.0
+                signals["rubric_gate_internal_vlm_judge_reward_pass"] = 0.0 if not combined_reward_pass else 1.0
+            else:
+                row["reward"] = 0.0
+            if row.get("feasible"):
+                signals["rubric_gate_internal_vlm_judge_pass"] = 1.0 if judge_pass else 0.0
+                signals["rubric_gate_internal_vlm_judge_reward_pass"] = 1.0
+
+    @staticmethod
+    def _scope_rubric_prompt(text: str, target_region: str, mode: str) -> str:
+        text = str(text).strip()
+        target_region = str(target_region or "").strip()
+        if not text or not target_region or target_region == "main visible target":
+            return text
+        lowered = text.lower()
+        region_lowered = target_region.lower()
+        if region_lowered in lowered:
+            return text
+
+        words = lowered.split()
+        relation_terms = {
+            "visible",
+            "present",
+            "contains",
+            "contain",
+            "added",
+            "removed",
+            "replaced",
+            "changed",
+            "background",
+            "foreground",
+            "left",
+            "right",
+            "above",
+            "below",
+            "behind",
+            "front",
+        }
+        has_relation = any(term in lowered for term in relation_terms)
+        has_auxiliary = any(token in words for token in {"is", "are", "has", "have", "still", "remains", "remain"})
+        if len(words) <= 3 and not has_relation and not has_auxiliary:
+            return f"{target_region} is {text}"
+        if mode == "forbidden":
+            return f"{text} in {target_region}"
+        return f"{text} in {target_region}"
+
+    @staticmethod
+    def _is_generic_forbidden_prompt(text: str) -> bool:
+        lowered = str(text).strip().lower()
+        if not lowered:
+            return True
+        generic_markers = (
+            "no other",
+            "not other",
+            "any other",
+            "any object that changes",
+            "changes the overall",
+            "overall layout",
+            "other objects",
+            "other background",
+            "unrelated objects",
+            "extra objects",
+            "additional objects",
+        )
+        return any(marker in lowered for marker in generic_markers)
+
+    @staticmethod
+    def _is_placeholder_source_descriptor(text: Any) -> bool:
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return True
+        placeholders = {
+            "old",
+            "original",
+            "current",
+            "previous",
+            "existing",
+            "source",
+            "old color",
+            "original color",
+            "current color",
+            "previous color",
+            "existing color",
+            "source color",
+            "old appearance",
+            "original appearance",
+            "current appearance",
+            "previous appearance",
+            "existing appearance",
+        }
+        return lowered in placeholders
+
+    @staticmethod
+    def _rubric_content_terms(text: Any) -> set[str]:
+        stopwords = {
+            "a",
+            "an",
+            "the",
+            "no",
+            "not",
+            "without",
+            "any",
+            "other",
+            "than",
+            "is",
+            "are",
+            "has",
+            "have",
+            "had",
+            "be",
+            "been",
+            "being",
+            "in",
+            "on",
+            "at",
+            "to",
+            "of",
+            "for",
+            "with",
+            "from",
+            "near",
+            "visible",
+            "remains",
+            "remain",
+            "still",
+            "added",
+            "add",
+            "new",
+            "small",
+            "large",
+        }
+        terms = set()
+        for token in re.findall(r"[a-z0-9]+", str(text or "").lower()):
+            if token in stopwords:
+                continue
+            if len(token) > 3 and token.endswith("s"):
+                token = token[:-1]
+            terms.add(token)
+        return terms
+
+    def _is_contradictory_forbidden_prompt(self, text: str, spec: dict[str, Any]) -> bool:
+        edit_type = str(spec.get("edit_type", ""))
+        if edit_type not in {
+            "object_addition",
+            "attribute_change",
+            "color_change",
+            "material_change",
+            "style_transfer",
+            "background_change",
+        }:
+            return False
+        lowered = str(text or "").lower()
+        if not any(marker in lowered for marker in ("no ", "not ", "without ", "absent", "missing")):
+            return False
+        required_terms: set[str] = set()
+        for prompt in spec.get("required_after", []):
+            required_terms.update(self._rubric_content_terms(prompt))
+        for key in ("target_object", "replacement", "target_attribute", "target_material", "target_style"):
+            required_terms.update(self._rubric_content_terms(spec.get(key)))
+        forbidden_terms = self._rubric_content_terms(text)
+        return bool(required_terms and forbidden_terms and required_terms.intersection(forbidden_terms))
+
+    def _prompt_support_cached(
+        self,
+        pipe: Any,
+        prompt: str,
+        image_label: str,
+        image: Image.Image,
+        cache: dict[tuple[str, str], Any],
+    ) -> float:
+        prompt = polish_prompt(prompt, use_prompt_polish=False, image_context=image)
+        text_feature = self._cached_text_feature(pipe, prompt, cache)
+        image_feature = self._cached_understanding_feature(pipe, prompt, image_label, image, cache)
+        return _clamp(0.5 * (1.0 + self._cosine_similarity(image_feature, text_feature)))
+
+    def _feature_preservation_score(
+        self,
+        pipe: Any,
+        prompt: str,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> float:
+        prompt = polish_prompt(prompt, use_prompt_polish=False, image_context=original)
+        original_feature = self._cached_understanding_feature(pipe, prompt, "original", original, cache)
+        edited_feature = self._cached_understanding_feature(
+            pipe,
+            prompt,
+            f"candidate:{candidate_index}",
+            edited,
+            cache,
+        )
+        cosine_01 = _clamp(0.5 * (1.0 + self._cosine_similarity(original_feature, edited_feature)))
+        return _clamp(math.exp(-(1.0 - cosine_01) / max(self.rubric_preservation_temperature, 1e-6)))
+
+    def _rubric_prompts(self, proposal: EditProposal) -> dict[str, Any]:
+        spec = normalize_structured_edit(
+            proposal.structured_edit,
+            instruction=proposal.instruction,
+            family=proposal.definition.family,
+        )
+        edit_type = str(spec.get("edit_type", "local_enhancement"))
+        source_object = spec.get("source_object") or spec.get("target")
+        target_region = spec.get("target_region", "main visible target")
+        source_required_types = {
+            "object_replacement",
+            "object_removal",
+            "spatial_move",
+            "attribute_change",
+            "color_change",
+            "material_change",
+        }
+        source_prompts = []
+        if source_object and edit_type in source_required_types:
+            source_prompts.append(f"{source_object} is visible in {target_region}")
+        required_prompts = self._unique_texts(
+            [
+                self._scope_rubric_prompt(prompt, target_region, "required")
+                for prompt in spec.get("required_after", [])
+            ],
+            self.max_rubric_items,
+        )
+        source_state_fields = {
+            "attribute_change": ("source_attribute",),
+            "color_change": ("source_attribute",),
+            "material_change": ("source_material",),
+            "style_transfer": ("source_style",),
+        }
+        old_state_is_explicit = any(
+            spec.get(field) and not self._is_placeholder_source_descriptor(spec.get(field))
+            for field in source_state_fields.get(edit_type, ())
+        )
+        use_forbidden_prompts = edit_type not in source_state_fields or old_state_is_explicit
+        if edit_type == "object_addition":
+            use_forbidden_prompts = False
+        forbidden_prompts = self._unique_texts(
+            [
+                self._scope_rubric_prompt(prompt, target_region, "forbidden")
+                for prompt in (spec.get("forbidden_after", []) if use_forbidden_prompts else [])
+                if not self._is_generic_forbidden_prompt(prompt)
+                and not self._is_contradictory_forbidden_prompt(prompt, spec)
+            ],
+            self.max_rubric_items,
+        )
+        preserve_prompts = self._unique_texts(
+            [f"{item} is preserved" for item in spec.get("preserve", [])],
+            self.max_rubric_items,
+        )
+        return {
+            "spec": spec,
+            "source_prompts": self._unique_texts(source_prompts, self.max_rubric_items),
+            "required_prompts": required_prompts,
+            "forbidden_prompts": forbidden_prompts,
+            "preserve_prompts": preserve_prompts,
+        }
+
+    def _source_grounding_score(
+        self,
+        pipe: Any,
+        prompts: list[str],
+        original: Image.Image,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, dict[str, float]]:
+        if not prompts:
+            return 1.0, {
+                "rubric_source_grounding_score": 1.0,
+                "rubric_source_grounding_supported": 0.0,
+            }
+        scores = []
+        supports = []
+        for prompt in prompts:
+            support = self._prompt_support_cached(pipe, prompt, "original", original, cache)
+            supports.append(support)
+            scores.append(
+                _sigmoid((support - self.rubric_support_center) / max(self.rubric_abs_temperature, 1e-6))
+            )
+        score = self._geometric_mean(scores)
+        return score, {
+            "rubric_source_grounding_score": score,
+            "rubric_source_grounding_supported": 1.0,
+            "rubric_source_grounding_support": statistics.mean(supports) if supports else 0.0,
+            "rubric_source_grounding_prompt_count": float(len(prompts)),
+        }
+
+    def _required_after_score(
+        self,
+        pipe: Any,
+        prompts: list[str],
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, dict[str, float]]:
+        if not prompts:
+            return 1.0, {
+                "rubric_required_after_score": 1.0,
+                "rubric_required_after_supported": 0.0,
+            }
+        scores = []
+        gains = []
+        supports = []
+        for prompt in prompts:
+            gain = self._prompt_gain_cached(pipe, prompt, original, edited, candidate_index, cache)
+            support = self._prompt_support_cached(pipe, prompt, f"candidate:{candidate_index}", edited, cache)
+            gains.append(gain)
+            supports.append(support)
+            gain_score = _sigmoid((gain - self.min_required_gain) / max(self.rubric_gain_temperature, 1e-6))
+            support_score = _sigmoid(
+                (support - self.rubric_support_center) / max(self.rubric_abs_temperature, 1e-6)
+            )
+            scores.append(math.sqrt(max(gain_score * support_score, 0.0)))
+        score = self._geometric_mean(scores)
+        return score, {
+            "rubric_required_after_score": score,
+            "rubric_required_after_supported": 1.0,
+            "rubric_required_after_gain": statistics.mean(gains) if gains else 0.0,
+            "rubric_required_after_support": statistics.mean(supports) if supports else 0.0,
+            "rubric_required_after_prompt_count": float(len(prompts)),
+        }
+
+    def _forbidden_after_absent_score(
+        self,
+        pipe: Any,
+        prompts: list[str],
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, dict[str, float]]:
+        if not prompts:
+            return 1.0, {
+                "rubric_forbidden_after_absent_score": 1.0,
+                "rubric_forbidden_after_supported": 0.0,
+            }
+        scores = []
+        drops = []
+        edited_supports = []
+        for prompt in prompts:
+            original_support = self._prompt_support_cached(pipe, prompt, "original", original, cache)
+            edited_support = self._prompt_support_cached(pipe, prompt, f"candidate:{candidate_index}", edited, cache)
+            gain = self._prompt_gain_cached(pipe, prompt, original, edited, candidate_index, cache)
+            drop = max(-gain, original_support - edited_support)
+            drops.append(drop)
+            edited_supports.append(edited_support)
+            drop_score = _sigmoid((drop - self.min_forbidden_drop) / max(self.rubric_gain_temperature, 1e-6))
+            absence_score = _sigmoid(
+                (self.rubric_forbidden_absence_center - edited_support)
+                / max(self.rubric_abs_temperature, 1e-6)
+            )
+            scores.append(math.sqrt(max(drop_score * absence_score, 0.0)))
+        score = self._geometric_mean(scores)
+        return score, {
+            "rubric_forbidden_after_absent_score": score,
+            "rubric_forbidden_after_supported": 1.0,
+            "rubric_forbidden_after_drop": statistics.mean(drops) if drops else 0.0,
+            "rubric_forbidden_after_edited_support": statistics.mean(edited_supports) if edited_supports else 0.0,
+            "rubric_forbidden_after_prompt_count": float(len(prompts)),
+        }
+
+    def _rubric_preservation_score(
+        self,
+        pipe: Any,
+        prompts: list[str],
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[float, dict[str, float]]:
+        if not prompts:
+            return 1.0, {
+                "rubric_preservation_score": 1.0,
+                "rubric_preservation_supported": 0.0,
+            }
+        scores = [
+            self._feature_preservation_score(pipe, prompt, original, edited, candidate_index, cache)
+            for prompt in prompts
+        ]
+        score = self._geometric_mean(scores)
+        return score, {
+            "rubric_preservation_score": score,
+            "rubric_preservation_supported": 1.0,
+            "rubric_preservation_prompt_count": float(len(prompts)),
+        }
+
+    def _rubric_score(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        validity: float,
+        cache: dict[tuple[str, str], Any],
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        prompts = self._rubric_prompts(proposal)
+        source_grounded, source_signals = self._source_grounding_score(
+            pipe, prompts["source_prompts"], original, cache
+        )
+        required_after, required_signals = self._required_after_score(
+            pipe, prompts["required_prompts"], original, edited, candidate_index, cache
+        )
+        forbidden_absent, forbidden_signals = self._forbidden_after_absent_score(
+            pipe, prompts["forbidden_prompts"], original, edited, candidate_index, cache
+        )
+        explicit_preservation, preservation_signals = self._rubric_preservation_score(
+            pipe, prompts["preserve_prompts"], original, edited, candidate_index, cache
+        )
+        edit_components = [required_after]
+        if prompts["forbidden_prompts"]:
+            edit_components.append(forbidden_absent)
+        edit_success = self._geometric_mean(edit_components)
+        reward = source_grounded * self._geometric_mean([edit_success, explicit_preservation, validity])
+        scores = {
+            "rubric_source_grounded": source_grounded,
+            "rubric_required_after": required_after,
+            "rubric_forbidden_after_absent": forbidden_absent,
+            "rubric_edit_success": edit_success,
+            "rubric_preservation": explicit_preservation,
+            "rubric_validity": validity,
+            "rubric_reward": _clamp(reward),
+        }
+        signals = {
+            **source_signals,
+            **required_signals,
+            **forbidden_signals,
+            **preservation_signals,
+            "rubric_source_threshold": self.rubric_source_threshold,
+            "rubric_required_threshold": self.rubric_required_threshold,
+            "rubric_forbidden_threshold": self.rubric_forbidden_threshold,
+            "rubric_preservation_threshold": self.rubric_preservation_threshold,
+            "rubric_reward_threshold": self.rubric_reward_threshold,
+        }
+        return scores, signals
+
+    def _resolve_object_detector_device(self):
+        import torch
+
+        if self.object_detector_device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(self.object_detector_device)
+
+    def _resolve_object_detector_dtype(self, device: Any):
+        import torch
+
+        if device.type == "cpu":
+            return torch.float32
+        dtype_name = self.object_detector_torch_dtype
+        if dtype_name == "auto":
+            return torch.float32
+        return getattr(torch, dtype_name, torch.float16)
+
+    def _ensure_object_detector(self):
+        if self._object_detector_model is not None and self._object_detector_processor is not None:
+            return (
+                self._object_detector_model,
+                self._object_detector_processor,
+                self._object_detector_device_resolved,
+            )
+
+        from transformers import AutoProcessor, GroundingDinoForObjectDetection
+
+        device = self._resolve_object_detector_device()
+        dtype = self._resolve_object_detector_dtype(device)
+        self._object_detector_processor = AutoProcessor.from_pretrained(self.object_detector_model_id)
+        self._object_detector_model = GroundingDinoForObjectDetection.from_pretrained(
+            self.object_detector_model_id,
+            torch_dtype=dtype,
+        )
+        self._object_detector_model.to(device)
+        self._object_detector_model.eval()
+        self._object_detector_device_resolved = device
+        return self._object_detector_model, self._object_detector_processor, device
+
+    @staticmethod
+    def _object_detector_phrase(text: Any) -> str:
+        phrase = str(text or "").strip().lower()
+        phrase = re.sub(r"\b(the|a|an)\b", " ", phrase)
+        phrase = re.sub(r"\b(original|requested|source|target|same|visible|location|area|object|objects)\b", " ", phrase)
+        phrase = re.sub(r"[^a-z0-9 ]+", " ", phrase)
+        phrase = re.sub(r"\s+", " ", phrase).strip()
+        return phrase
+
+    def _detect_object_boxes(
+        self,
+        image: Image.Image,
+        phrase: str,
+        cache: dict[tuple[str, str], Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        phrase = self._object_detector_phrase(phrase)
+        if not phrase:
+            return []
+        cache_key = ("object_detector_boxes", f"{id(image)}:{image.size[0]}x{image.size[1]}:{phrase}")
+        if cache is not None and cache_key in cache:
+            return list(cache[cache_key])
+        model, processor, device = self._ensure_object_detector()
+        prompt = phrase if phrase.endswith(".") else f"{phrase}."
+
+        import torch
+
+        inputs = processor(images=image.convert("RGB"), text=prompt, return_tensors="pt")
+        model_dtype = next(model.parameters()).dtype
+        converted_inputs = {}
+        for key, value in inputs.items():
+            if hasattr(value, "to"):
+                if torch.is_floating_point(value):
+                    converted_inputs[key] = value.to(device=device, dtype=model_dtype)
+                else:
+                    converted_inputs[key] = value.to(device)
+            else:
+                converted_inputs[key] = value
+        inputs = converted_inputs
+        with torch.no_grad():
+            outputs = model(**inputs)
+        target_sizes = [(image.height, image.width)]
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            input_ids=inputs.get("input_ids"),
+            threshold=self.object_detector_box_threshold,
+            text_threshold=self.object_detector_text_threshold,
+            target_sizes=target_sizes,
+        )
+        if not results:
+            if cache is not None:
+                cache[cache_key] = []
+            return []
+        result = results[0]
+        scores = result.get("scores")
+        boxes = result.get("boxes")
+        if scores is None or boxes is None or len(scores) == 0 or len(boxes) == 0:
+            if cache is not None:
+                cache[cache_key] = []
+            return []
+        labels = result.get("labels") or []
+        detected: list[dict[str, Any]] = []
+        for index in range(min(len(scores), len(boxes))):
+            raw_score = scores[index]
+            raw_box = boxes[index]
+            score = float(raw_score.detach().float().cpu().item() if hasattr(raw_score, "detach") else raw_score)
+            box_values = (
+                raw_box.detach().float().cpu().tolist()
+                if hasattr(raw_box, "detach")
+                else list(raw_box)
+            )
+            if len(box_values) != 4:
+                continue
+            detected.append(
+                {
+                    "score": score,
+                    "box": tuple(float(value) for value in box_values),
+                    "label": str(labels[index]) if index < len(labels) else phrase,
+                }
+            )
+        detected.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        if cache is not None:
+            cache[cache_key] = list(detected)
+        return detected
+
+    def _detect_object_score(
+        self,
+        image: Image.Image,
+        phrase: str,
+        cache: dict[tuple[str, str], Any] | None = None,
+    ) -> float:
+        boxes = self._detect_object_boxes(image, phrase, cache=cache)
+        if not boxes:
+            return 0.0
+        return max(float(item.get("score", 0.0)) for item in boxes)
+
+    def _object_detector_contract_score(
+        self,
+        spec: dict[str, Any],
+        original: Image.Image,
+        edited: Image.Image,
+        cache: dict[tuple[str, str], Any] | None = None,
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        edit_type = str(spec.get("edit_type", ""))
+        if not self.object_detector_enabled or edit_type not in self.object_detector_edit_types:
+            return {
+                "object_detector_contract": 1.0,
+            }, {
+                "object_detector_supported": 0.0,
+                "object_detector_gate_pass": 1.0,
+            }
+
+        source_phrase = self._object_detector_phrase(
+            spec.get("source_object") or spec.get("target") or spec.get("target_object")
+        )
+        target_phrase = self._object_detector_phrase(spec.get("target_object") or spec.get("replacement"))
+        if not source_phrase:
+            return {
+                "object_detector_contract": 1.0,
+            }, {
+                "object_detector_supported": 0.0,
+                "object_detector_missing_source_phrase": 1.0,
+                "object_detector_gate_pass": 1.0,
+            }
+
+        try:
+            original_source_score = self._detect_object_score(original, source_phrase, cache=cache)
+            edited_source_score = self._detect_object_score(edited, source_phrase, cache=cache)
+        except Exception as exc:
+            return {
+                "object_detector_contract": 0.0,
+                "object_detector_original_source_score": 0.0,
+                "object_detector_edited_source_score": 1.0,
+                "object_detector_edited_target_score": 0.0,
+                "object_detector_source_grounding": 0.0,
+                "object_detector_source_absence": 0.0,
+                "object_detector_target_presence": 0.0,
+            }, {
+                "object_detector_supported": 1.0,
+                "object_detector_error": 1.0,
+                "object_detector_error_type": exc.__class__.__name__,
+                "object_detector_error_message": str(exc)[:300],
+                "object_detector_source_detected_pass": 0.0,
+                "object_detector_source_absent_pass": 0.0,
+                "object_detector_target_present_pass": 0.0,
+                "object_detector_gate_pass": 0.0,
+                "object_detector_original_min_score": self.object_detector_original_min_score,
+                "object_detector_edited_absent_max_score": self.object_detector_edited_absent_max_score,
+                "object_detector_absent_ratio": self.object_detector_absent_ratio,
+                "object_detector_target_min_score": self.object_detector_target_min_score,
+                "object_detector_score_threshold": self.object_detector_score_threshold,
+            }
+        source_detected = (
+            original_source_score >= self.object_detector_original_min_score
+            or not self.object_detector_require_original_detection
+        )
+        absent_cutoff = max(
+            self.object_detector_edited_absent_max_score,
+            original_source_score * self.object_detector_absent_ratio,
+        )
+        source_absent = edited_source_score <= absent_cutoff
+        source_grounding_score = _sigmoid(
+            (original_source_score - self.object_detector_original_min_score)
+            / max(self.object_detector_score_temperature, 1e-6)
+        )
+        source_absence_score = _sigmoid(
+            (absent_cutoff - edited_source_score) / max(self.object_detector_score_temperature, 1e-6)
+        )
+
+        target_score = 1.0
+        target_present = True
+        target_presence_score = 1.0
+        if edit_type == "object_replacement":
+            if not target_phrase:
+                target_score = 0.0
+                target_present = False
+                target_presence_score = 0.0
+            else:
+                try:
+                    target_score = self._detect_object_score(edited, target_phrase, cache=cache)
+                except Exception as exc:
+                    return {
+                        "object_detector_contract": 0.0,
+                        "object_detector_original_source_score": original_source_score,
+                        "object_detector_edited_source_score": edited_source_score,
+                        "object_detector_absent_cutoff": absent_cutoff,
+                        "object_detector_edited_target_score": 0.0,
+                        "object_detector_source_grounding": source_grounding_score,
+                        "object_detector_source_absence": source_absence_score,
+                        "object_detector_target_presence": 0.0,
+                    }, {
+                        "object_detector_supported": 1.0,
+                        "object_detector_error": 1.0,
+                        "object_detector_error_type": exc.__class__.__name__,
+                        "object_detector_error_message": str(exc)[:300],
+                        "object_detector_source_detected_pass": 1.0 if source_detected else 0.0,
+                        "object_detector_source_absent_pass": 1.0 if source_absent else 0.0,
+                        "object_detector_target_present_pass": 0.0,
+                        "object_detector_gate_pass": 0.0,
+                        "object_detector_original_min_score": self.object_detector_original_min_score,
+                        "object_detector_edited_absent_max_score": self.object_detector_edited_absent_max_score,
+                        "object_detector_absent_ratio": self.object_detector_absent_ratio,
+                        "object_detector_target_min_score": self.object_detector_target_min_score,
+                        "object_detector_score_threshold": self.object_detector_score_threshold,
+                    }
+                target_present = target_score >= self.object_detector_target_min_score
+                target_presence_score = _sigmoid(
+                    (target_score - self.object_detector_target_min_score)
+                    / max(self.object_detector_score_temperature, 1e-6)
+                )
+
+        component_values = [source_absence_score, target_presence_score]
+        if self.object_detector_require_original_detection:
+            component_values.insert(0, source_grounding_score)
+        contract_score = self._geometric_mean(component_values)
+        gate_pass = (
+            source_detected
+            and source_absent
+            and target_present
+            and contract_score >= self.object_detector_score_threshold
+        )
+        scores = {
+            "object_detector_contract": contract_score,
+            "object_detector_original_source_score": original_source_score,
+            "object_detector_edited_source_score": edited_source_score,
+            "object_detector_absent_cutoff": absent_cutoff,
+            "object_detector_edited_target_score": target_score,
+            "object_detector_source_grounding": source_grounding_score,
+            "object_detector_source_absence": source_absence_score,
+            "object_detector_target_presence": target_presence_score,
+        }
+        signals = {
+            "object_detector_supported": 1.0,
+            "object_detector_source_detected_pass": 1.0 if source_detected else 0.0,
+            "object_detector_source_absent_pass": 1.0 if source_absent else 0.0,
+            "object_detector_target_present_pass": 1.0 if target_present else 0.0,
+            "object_detector_gate_pass": 1.0 if gate_pass else 0.0,
+            "object_detector_original_min_score": self.object_detector_original_min_score,
+            "object_detector_edited_absent_max_score": self.object_detector_edited_absent_max_score,
+            "object_detector_absent_ratio": self.object_detector_absent_ratio,
+            "object_detector_target_min_score": self.object_detector_target_min_score,
+            "object_detector_score_threshold": self.object_detector_score_threshold,
+        }
+        return scores, signals
+
+    def _conservative_region_target_phrase(self, spec: dict[str, Any]) -> str:
+        edit_type = str(spec.get("edit_type", ""))
+        if edit_type == "object_addition":
+            return ""
+        phrase = (
+            spec.get("source_object")
+            or spec.get("target")
+            or spec.get("target_object")
+            or spec.get("target_region")
+        )
+        phrase = self._object_detector_phrase(phrase)
+        generic_phrases = {
+            "background",
+            "whole image",
+            "entire image",
+            "main visible target",
+            "plausible open area of scene",
+            "target region",
+        }
+        return "" if phrase in generic_phrases else phrase
+
+    def _conservative_region_mask(
+        self,
+        spec: dict[str, Any],
+        original: Image.Image,
+        edited: Image.Image,
+        cache: dict[tuple[str, str], Any] | None = None,
+    ) -> tuple[Any | None, dict[str, Any]]:
+        mask_size = (
+            max(16, self.conservative_region_mask_size),
+            max(16, self.conservative_region_mask_size),
+        )
+        phrase = self._conservative_region_target_phrase(spec)
+        signals: dict[str, Any] = {
+            "conservative_region_target_phrase": phrase,
+            "conservative_region_mask_source": "none",
+            "conservative_region_mask_supported": 0.0,
+            "conservative_region_detector_score": 0.0,
+            "conservative_region_detector_box_count": 0.0,
+            "conservative_region_diff_fallback_used": 0.0,
+        }
+        if (
+            self.conservative_region_use_object_detector
+            and self.object_detector_enabled
+            and phrase
+        ):
+            try:
+                detections = self._detect_object_boxes(original, phrase, cache=cache)
+            except Exception as exc:
+                detections = []
+                signals["conservative_region_detector_error"] = 1.0
+                signals["conservative_region_detector_error_type"] = exc.__class__.__name__
+                signals["conservative_region_detector_error_message"] = str(exc)[:300]
+            boxes = [
+                tuple(item["box"])
+                for item in detections[: max(1, self.conservative_region_max_detector_boxes)]
+                if "box" in item
+            ]
+            if boxes:
+                mask = box_mask_from_boxes(
+                    original.size,
+                    boxes,
+                    size=mask_size,
+                    padding_fraction=self.conservative_region_mask_padding_fraction,
+                )
+                if mask.any():
+                    signals["conservative_region_mask_source"] = "object_detector"
+                    signals["conservative_region_mask_supported"] = 1.0
+                    signals["conservative_region_detector_score"] = float(detections[0].get("score", 0.0))
+                    signals["conservative_region_detector_box_count"] = float(len(boxes))
+                    return mask, signals
+
+        if self.conservative_region_fallback_to_diff_mask:
+            mask = diff_mask(
+                original,
+                edited,
+                diff_threshold=self.conservative_region_diff_threshold,
+                size=mask_size,
+                dilation_radius=self.conservative_region_diff_dilation_radius,
+            )
+            if mask.any():
+                signals["conservative_region_mask_source"] = "diff_fallback"
+                signals["conservative_region_diff_fallback_used"] = 1.0
+                return mask, signals
+
+        return None, signals
+
+    def _conservative_region_score(
+        self,
+        spec: dict[str, Any],
+        original: Image.Image,
+        edited: Image.Image,
+        cache: dict[tuple[str, str], Any] | None = None,
+    ) -> tuple[dict[str, float], dict[str, Any]]:
+        edit_type = str(spec.get("edit_type", "local_enhancement"))
+        active = (
+            self.conservative_region_reward_enabled
+            and edit_type in self.conservative_region_edit_types
+        )
+        base_scores = {
+            "conservative_region_reward": 1.0,
+            "conservative_region_observed_reward": 1.0,
+            "conservative_target_change_score": 1.0,
+            "conservative_outside_preservation": 1.0,
+            "conservative_outside_changed_fraction_score": 1.0,
+            "conservative_localization_precision": 1.0,
+        }
+        base_signals: dict[str, Any] = {
+            "conservative_region_active": 1.0 if active else 0.0,
+            "conservative_region_gate_pass": 1.0,
+            "conservative_region_gate_applicable": 0.0,
+            "conservative_region_requires_mask": (
+                1.0 if edit_type in self.conservative_region_require_mask_edit_types else 0.0
+            ),
+            "conservative_region_min_reward": self.conservative_region_min_reward,
+            "conservative_region_min_outside_preservation": self.conservative_region_min_outside_preservation,
+            "conservative_region_max_outside_change": self.conservative_region_max_outside_change,
+            "conservative_region_max_outside_changed_fraction": (
+                self.conservative_region_max_outside_changed_fraction
+            ),
+            "conservative_region_min_target_change_score": (
+                self.conservative_region_min_target_change_score
+            ),
+        }
+        if not active:
+            return base_scores, base_signals
+
+        requires_mask = edit_type in self.conservative_region_require_mask_edit_types
+        mask, mask_signals = self._conservative_region_mask(spec, original, edited, cache=cache)
+        base_signals.update(mask_signals)
+        if mask is None:
+            gate_pass = not requires_mask
+            base_scores["conservative_region_reward"] = 1.0 if gate_pass else 0.0
+            base_scores["conservative_region_observed_reward"] = 0.0
+            base_signals.update(
+                {
+                    "conservative_region_missing_mask": 1.0,
+                    "conservative_region_gate_pass": 1.0 if gate_pass else 0.0,
+                    "conservative_region_reject_reason": (
+                        "missing_target_mask" if not gate_pass else "not_applicable"
+                    ),
+                }
+            )
+            return base_scores, base_signals
+
+        stats = masked_region_statistics(
+            original,
+            edited,
+            mask,
+            diff_threshold=self.conservative_region_diff_threshold,
+            size=(
+                max(16, self.conservative_region_mask_size),
+                max(16, self.conservative_region_mask_size),
+            ),
+        )
+        target_area = stats["target_area_fraction"]
+        area_pass = (
+            target_area >= self.conservative_region_min_target_area
+            and target_area <= self.conservative_region_max_target_area
+        )
+        target_change_score = _sigmoid(
+            (stats["target_change"] - self.conservative_region_min_target_change)
+            / max(self.conservative_region_target_change_temperature, 1e-6)
+        )
+        outside_preservation = _sigmoid(
+            (self.conservative_region_max_outside_change - stats["outside_change"])
+            / max(self.conservative_region_outside_change_temperature, 1e-6)
+        )
+        outside_fraction_score = _sigmoid(
+            (
+                self.conservative_region_max_outside_changed_fraction
+                - stats["outside_changed_fraction"]
+            )
+            / max(0.08, self.conservative_region_outside_change_temperature)
+        )
+        localization_score = _sigmoid(
+            (
+                stats["localization_precision"]
+                - self.conservative_region_min_localization_precision
+            )
+            / 0.10
+        )
+        observed_reward = self._geometric_mean(
+            [
+                target_change_score,
+                outside_preservation,
+                outside_fraction_score,
+                localization_score,
+            ]
+        )
+        mask_source = str(base_signals.get("conservative_region_mask_source", "none"))
+        gate_applicable = (
+            mask_source == "object_detector"
+            or (
+                mask_source == "diff_fallback"
+                and self.conservative_region_diff_fallback_allows_gate
+            )
+        )
+        if requires_mask and mask_source != "object_detector":
+            gate_applicable = True
+            mask_gate_pass = False
+        else:
+            mask_gate_pass = True
+        target_change_pass = target_change_score >= self.conservative_region_min_target_change_score
+        outside_change_pass = stats["outside_change"] <= self.conservative_region_max_outside_change
+        outside_fraction_pass = (
+            stats["outside_changed_fraction"]
+            <= self.conservative_region_max_outside_changed_fraction
+        )
+        outside_preservation_pass = (
+            outside_preservation >= self.conservative_region_min_outside_preservation
+        )
+        reward_pass = observed_reward >= self.conservative_region_min_reward
+        gate_pass = (
+            (not gate_applicable)
+            or (
+                mask_gate_pass
+                and area_pass
+                and target_change_pass
+                and outside_change_pass
+                and outside_fraction_pass
+                and outside_preservation_pass
+                and reward_pass
+            )
+        )
+        effective_reward = observed_reward if gate_applicable else 1.0
+        reject_reason = "accepted"
+        if not mask_gate_pass:
+            reject_reason = "target_mask_not_supported"
+        elif not area_pass:
+            reject_reason = "target_mask_area"
+        elif not target_change_pass:
+            reject_reason = "target_change"
+        elif not outside_change_pass:
+            reject_reason = "outside_change"
+        elif not outside_fraction_pass:
+            reject_reason = "outside_changed_fraction"
+        elif not outside_preservation_pass:
+            reject_reason = "outside_preservation"
+        elif not reward_pass:
+            reject_reason = "region_reward"
+        elif not gate_applicable:
+            reject_reason = "not_applicable"
+
+        scores = {
+            "conservative_region_reward": _clamp(effective_reward),
+            "conservative_region_observed_reward": _clamp(observed_reward),
+            "conservative_target_change_score": _clamp(target_change_score),
+            "conservative_outside_preservation": _clamp(outside_preservation),
+            "conservative_outside_changed_fraction_score": _clamp(outside_fraction_score),
+            "conservative_localization_precision": _clamp(stats["localization_precision"]),
+        }
+        signals = {
+            **base_signals,
+            "conservative_region_gate_applicable": 1.0 if gate_applicable else 0.0,
+            "conservative_region_gate_pass": 1.0 if gate_pass else 0.0,
+            "conservative_region_reject_reason": reject_reason,
+            "conservative_region_area_pass": 1.0 if area_pass else 0.0,
+            "conservative_region_mask_gate_pass": 1.0 if mask_gate_pass else 0.0,
+            "conservative_region_target_change_pass": 1.0 if target_change_pass else 0.0,
+            "conservative_region_outside_change_pass": 1.0 if outside_change_pass else 0.0,
+            "conservative_region_outside_fraction_pass": 1.0 if outside_fraction_pass else 0.0,
+            "conservative_region_outside_preservation_pass": (
+                1.0 if outside_preservation_pass else 0.0
+            ),
+            "conservative_region_reward_pass": 1.0 if reward_pass else 0.0,
+            "conservative_target_area_fraction": target_area,
+            "conservative_outside_area_fraction": stats["outside_area_fraction"],
+            "conservative_changed_fraction": stats["changed_fraction"],
+            "conservative_target_change": stats["target_change"],
+            "conservative_outside_change": stats["outside_change"],
+            "conservative_target_changed_fraction": stats["target_changed_fraction"],
+            "conservative_outside_changed_fraction": stats["outside_changed_fraction"],
+            "conservative_target_changed_pixel_fraction": stats["target_changed_pixel_fraction"],
+            "conservative_outside_changed_pixel_fraction": stats["outside_changed_pixel_fraction"],
+            "conservative_outside_psnr": stats["outside_psnr"],
+            "conservative_target_psnr": stats["target_psnr"],
+            "conservative_region_min_target_change": self.conservative_region_min_target_change,
+            "conservative_region_min_localization_precision": (
+                self.conservative_region_min_localization_precision
+            ),
+        }
+        return scores, signals
+
+    def _score_candidate_row(
+        self,
+        pipe: Any,
+        proposal: EditProposal,
+        original: Image.Image,
+        edited: Image.Image,
+        candidate_index: int,
+        scoring_device: str,
+    ) -> dict[str, Any]:
+        cache: dict[tuple[str, str], Any] = {}
+        try:
+            edit_specificity, edit_signals = self._edit_specificity(
+                pipe, proposal, original, edited, candidate_index, cache
+            )
+            taxonomy_score, taxonomy_signals = self._taxonomy_score(
+                pipe, proposal, original, edited, candidate_index, cache
+            )
+            preservation, validity, preservation_signals = self._preservation_and_validity(
+                pipe, proposal, original, edited, candidate_index, cache
+            )
+            rubric_scores, rubric_signals = self._rubric_score(
+                pipe, proposal, original, edited, candidate_index, validity, cache
+            )
+            spec = normalize_structured_edit(
+                proposal.structured_edit,
+                instruction=proposal.instruction,
+                family=proposal.definition.family,
+            )
+            edit_type = str(spec.get("edit_type", "local_enhancement"))
+            object_detector_scores, object_detector_signals = self._object_detector_contract_score(
+                spec,
+                original,
+                edited,
+                cache,
+            )
+            conservative_scores, conservative_signals = self._conservative_region_score(
+                spec,
+                original,
+                edited,
+                cache,
+            )
+
+            cepr_semantic_edit = (
+                math.sqrt(max(edit_specificity * taxonomy_score, 0.0))
+                if taxonomy_signals.get("cepr_taxonomy_supported", 0.0) > 0.0 or self.taxonomy_required
+                else edit_specificity
+            )
+            semantic_components = [rubric_scores["rubric_edit_success"]]
+            if object_detector_signals.get("object_detector_supported", 0.0) > 0.0:
+                semantic_components.append(object_detector_scores["object_detector_contract"])
+            if self.combine_cepr_semantics:
+                semantic_components.append(edit_specificity)
+                if taxonomy_signals.get("cepr_taxonomy_supported", 0.0) > 0.0 or self.taxonomy_required:
+                    semantic_components.append(taxonomy_score)
+            semantic_edit = self._geometric_mean(semantic_components)
+            preservation_score = self._geometric_mean(
+                [
+                    preservation,
+                    rubric_scores["rubric_preservation"],
+                    conservative_scores["conservative_region_reward"],
+                ]
+            )
+            reward = self._geometric_mean([semantic_edit, preservation_score])
+
+            forbidden_after_supported = rubric_signals.get("rubric_forbidden_after_supported", 0.0)
+            hard_forbidden_required = edit_type in self.rubric_hard_forbidden_edit_types
+            if hard_forbidden_required:
+                forbidden_gate_strict = (
+                    forbidden_after_supported > 0.0
+                    and rubric_scores["rubric_forbidden_after_absent"] >= self.rubric_hard_forbidden_threshold
+                )
+            else:
+                forbidden_gate_strict = (
+                    rubric_scores["rubric_forbidden_after_absent"] >= self.rubric_forbidden_threshold
+                    or forbidden_after_supported <= 0.0
+                )
+            forbidden_gate_softened = (
+                not hard_forbidden_required
+                and edit_type in self.rubric_soft_forbidden_edit_types
+                and rubric_scores["rubric_required_after"] >= self.rubric_soft_forbidden_required_threshold
+                and rubric_scores["rubric_reward"] >= self.rubric_soft_forbidden_reward_threshold
+                and rubric_scores["rubric_preservation"] >= self.rubric_soft_forbidden_preservation_threshold
+                and edit_specificity >= self.edit_threshold
+                and preservation >= self.preservation_threshold
+                and validity >= self.validity_threshold
+            )
+            forbidden_gate = forbidden_gate_strict or forbidden_gate_softened
+            taxonomy_gate = (
+                taxonomy_score >= self.taxonomy_threshold
+                or (
+                    taxonomy_signals.get("cepr_taxonomy_supported", 0.0) <= 0.0
+                    and not self.taxonomy_required
+                )
+            )
+            gate_status = {
+                "rubric_source_grounded": rubric_scores["rubric_source_grounded"] >= self.rubric_source_threshold,
+                "rubric_required_after": rubric_scores["rubric_required_after"] >= self.rubric_required_threshold,
+                "rubric_forbidden_gate": forbidden_gate,
+                "object_detector_contract": (
+                    object_detector_signals.get("object_detector_gate_pass", 1.0) >= 0.5
+                ),
+                "conservative_region": (
+                    conservative_signals.get("conservative_region_gate_pass", 1.0) >= 0.5
+                ),
+                "rubric_preservation": rubric_scores["rubric_preservation"] >= self.rubric_preservation_threshold,
+                "cepr_edit_specificity": edit_specificity >= self.edit_threshold,
+                "cepr_taxonomy": taxonomy_gate,
+                "cepr_preservation": preservation >= self.preservation_threshold,
+                "cepr_validity": validity >= self.validity_threshold,
+                "rubric_cepr_reward": reward >= self.rubric_reward_threshold,
+            }
+            feasible = all(gate_status.values())
+            reject_reason = "accepted"
+            if not feasible:
+                reject_reason = next(
+                    gate_name for gate_name, passed in gate_status.items() if not passed
+                )
+            return {
+                "candidate_index": candidate_index,
+                "edit_specificity": edit_specificity,
+                "taxonomy_score": taxonomy_score,
+                "semantic_edit": semantic_edit,
+                "preservation": preservation_score,
+                "validity": validity,
+                "reward": reward if feasible else 0.0,
+                "raw_reward": reward,
+                "feasible": feasible,
+                "component_scores": {
+                    "cepr_embedding_semantic_edit": cepr_semantic_edit,
+                    "rubric_source_grounded": rubric_scores["rubric_source_grounded"],
+                    "rubric_required_after": rubric_scores["rubric_required_after"],
+                    "rubric_forbidden_after_absent": rubric_scores["rubric_forbidden_after_absent"],
+                    "rubric_edit_success": rubric_scores["rubric_edit_success"],
+                    "rubric_preservation": rubric_scores["rubric_preservation"],
+                    "rubric_validity": rubric_scores["rubric_validity"],
+                    "rubric_reward": rubric_scores["rubric_reward"],
+                    "rubric_cepr_reward": reward if feasible else 0.0,
+                    "rubric_cepr_raw_reward": reward,
+                    **object_detector_scores,
+                    **conservative_scores,
+                },
+                "signals": {
+                    **edit_signals,
+                    **taxonomy_signals,
+                    **preservation_signals,
+                    **rubric_signals,
+                    **object_detector_signals,
+                    **conservative_signals,
+                    "cepr_internal_supported": 1.0,
+                    "cepr_scoring_device": scoring_device,
+                    "rubric_forbidden_gate_pass": 1.0 if forbidden_gate else 0.0,
+                    "rubric_forbidden_gate_strict_pass": 1.0 if forbidden_gate_strict else 0.0,
+                    "rubric_forbidden_gate_softened": 1.0 if forbidden_gate_softened else 0.0,
+                    "rubric_hard_forbidden_required": 1.0 if hard_forbidden_required else 0.0,
+                    "rubric_hard_forbidden_threshold": self.rubric_hard_forbidden_threshold,
+                    "rubric_soft_forbidden_required_threshold": self.rubric_soft_forbidden_required_threshold,
+                    "rubric_soft_forbidden_reward_threshold": self.rubric_soft_forbidden_reward_threshold,
+                    "rubric_soft_forbidden_preservation_threshold": self.rubric_soft_forbidden_preservation_threshold,
+                    "rubric_taxonomy_gate_pass": 1.0 if taxonomy_gate else 0.0,
+                    "rubric_reject_reason": reject_reason,
+                    **{
+                        f"rubric_gate_{gate_name}_pass": 1.0 if passed else 0.0
+                        for gate_name, passed in gate_status.items()
+                    },
+                },
+            }
+        finally:
+            cache.clear()
+            if self.empty_cache_per_candidate:
+                QwenEditEditor._empty_cuda_cache()
 
 
 def build_proposer(config: dict[str, Any]):
@@ -2041,6 +4962,12 @@ def build_evaluator(config: dict[str, Any]):
         evaluator_config.setdefault("counterfactual_distractors", 4)
         evaluator_config.setdefault("top_m", 1)
         return InternalContrastiveEditPreservationEvaluator(evaluator_config)
+    if backend in {"internal_cepr_rubric", "rubric_cepr", "internal_rubric_cepr"}:
+        evaluator_config = dict(config)
+        evaluator_config.setdefault("counterfactual_backend", "internal")
+        evaluator_config.setdefault("counterfactual_distractors", 4)
+        evaluator_config.setdefault("top_m", 1)
+        return InternalRubricCEPREvaluator(evaluator_config)
     raise ValueError(f"Unsupported evaluator backend: {backend}")
 
 

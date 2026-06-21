@@ -2,6 +2,16 @@
 
 This document summarizes the research idea, implemented system, current experimental status, known gaps, and recommended next technical direction. It is written for a coding or research agent that needs to continue the project without reading the full conversation history.
 
+Machine-use constraints are documented in:
+
+```text
+docs/SLURM_RESOURCE_GUIDELINES.md
+```
+
+Any training, evaluation, benchmark export, or GPU-heavy experiment must run
+inside a Slurm allocation, usually from a tmux session, using the `qedit` conda
+environment.
+
 ## Current Research Goal
 
 We are building a self-evolving image-editing framework on top of `Qwen/Qwen-Image-Edit-2509`.
@@ -41,11 +51,75 @@ source image
 -> trainable proposer creates structured edit instruction
 -> editor generates K candidate edits
 -> internal CEPR scores candidates
--> top feasible candidates are selected or weighted
--> editor LoRA is trained with weighted SFT
+-> accepted and near-miss same-group preference pairs are written
+-> editor LoRA is trained with pairwise preference learning
 -> proposer LoRA is trained from proposal-level reward
 -> next round continues from the updated checkpoints
 ```
+
+The current object-balanced diagnostic config is:
+
+```text
+configs/self_evolve/qwen_edit_2509_balanced_cepr_v2.yaml
+```
+
+This config should be treated as the active next-method direction. It adds scheduled edit-type
+coverage, edit-type-balanced training manifests, near-miss preference pairs for hard object edits,
+and versioned self-play from round 2 onward. The round-1 schedule deliberately includes
+`object_removal` and `object_replacement` before easy color/global edits so the first editor update
+cannot be dominated by the old color-heavy shard behavior.
+
+Important current details:
+
+- `weighted_sft.include_rejected=false`; rejected self-generated images are audit data, not direct
+  SFT targets.
+- `training.preference.enabled=true`; the editor trains on `preference_manifest.jsonl` with
+  `pairwise_linear_sdpo`.
+- Preference training requires a minimum number of real edit pairs before editor training is trusted;
+  preservation anchors are logged separately and do not satisfy this gate.
+- Object removal/replacement no longer use the embedding-style forbidden-object absence score as a
+  hard training contract. The score remains logged, but `rubric_forbidden_after_absent` and
+  `rubric_edit_success` are disabled for object training-contract checks because manual inspection
+  confirmed false negatives on valid removals. Object candidates still need high required-after,
+  preservation, validity, taxonomy, and raw CEPR.
+- The active generalized config does not use object-specific pair margins, pair weights, or
+  benchmark-specific curriculum. It uses a uniform low pair margin plus broad CEPR component
+  calibration, hard-negative failure-mode diversity, and family-balanced sampling across edit types.
+- The active generalized config now enables `evaluator.internal_vlm_judge`: an internal generative
+  Qwen-VLM self-judge that reuses the editor pipeline's own Qwen processor and text-encoder/VLM side.
+  It scores instruction following, edit success, target correctness, preservation, artifact freedom,
+  overall quality, and confidence for same-group candidates. CEPR/rubric gates remain the safety
+  mechanism; the judge refines raw reward/ranking and preference confidence, and is configured
+  `fail_open: true` so a judge parse/runtime failure falls back to CEPR instead of breaking a round.
+- `candidate_generation.self_play.enabled=true`, `start_round=2`, and `opponent=previous_round`.
+  After round 1 trains, future rounds can rank current-editor candidates against previous-editor
+  candidates for the same proposal.
+- Generalization update: the next method should avoid benchmark-specific curriculum. The active
+  config now adds broad-support preference calibration over rubric CEPR's internal Qwen-derived
+  components plus the internal Qwen-VLM judge, hard-negative failure-mode diversity, and
+  preference-mode preservation anchor replay.
+  The curriculum cycles uniformly over removal, replacement, addition, attribute, color, material,
+  spatial, background, style, and local enhancement edits.
+  The failure tags are generic (`under_edit`, `preservation_drift`, `invalid_or_artifact`,
+  `taxonomy_mismatch`, `weak_reward`, `hard_near_miss`) and apply across edit classes.
+- Preservation anchors are now written into `preference_manifest.jsonl` when preference training is
+  active. They use the source image as chosen and a self-generated edited image as rejected under a
+  reconstruction prompt. They regularize drift but do not satisfy minimum real edit-pair counts.
+
+Latest active run, 2026-06-02:
+
+- Config: `configs/self_evolve/qwen_edit_2509_balanced_cepr_v2.yaml`.
+- Tmux/Slurm session: `uug_balanced_v2`, job `504`.
+- Output root: `outputs/self_evolve/balanced_cepr_v5_soft_object_contract_diag96_r4_20260602T130155Z`.
+- First round schedule: 24 records, including 4 object-removal and 4 object-replacement groups.
+- Early health signal: first object-removal group completed with 1 accepted candidate from 4 scored
+  candidates under the corrected soft object contract.
+- First object-replacement group also completed with 1 accepted candidate. A local preference
+  simulation after patching the pair builder produced 6 pairs from the first two object groups:
+  3 removal and 3 replacement.
+- Probe evidence: `outputs/self_evolve/object_soft_contract_probe_r1_20260602T125658Z` accepted both
+  a removal and replacement object group, wrote zero rejected SFT targets, and completed cleanly
+  after fixing disabled proposer-training trigger parsing.
 
 ### Editor Training
 
@@ -60,10 +134,11 @@ This was added because the final model should be evaluated against the base Qwen
 
 Current editor update style:
 
-- Weighted SFT, not DPO/PPO.
-- Accepted candidates receive high weight.
-- Some rejected but useful candidates can receive smaller weight.
-- Reconstruction replay is included to reduce preservation drift.
+- Pairwise preference learning with `pairwise_linear_sdpo`.
+- Accepted pairs use the top feasible CEPR candidate as chosen and lower-ranked candidates as rejected.
+- Near-miss pairs are allowed for hard object groups when no candidate passes all gates but one candidate is clearly better under raw CEPR components.
+- Near-miss chosen images have `preference_sft_weight=0.0`, so failed outputs are never direct SFT targets.
+- The weighted SFT manifest is still written for audit/ablation, with rejected SFT targets disabled in the main configs.
 
 ### Proposer Training
 
@@ -82,6 +157,12 @@ src/qwen_edit_project/train/train_proposer_lora.py
 ```
 
 The proposer reward is band-pass, not "harder is always better." It should generate edit instructions that are useful and learnable for the editor. Very easy edits are weak supervision; overly hard edits produce failed candidates and sparse training.
+
+Object-focused runs enforce each record's scheduled edit type. The learned proposer gets the first
+attempt. If strict filtering removes every learned/scripted proposal, the current configs use
+`template_fallback_on_target_miss: true` to create a concrete target-type instruction from the
+record caption/metadata. This avoids silently starving removal/replacement records while keeping the
+fallback auditable through `proposal_plan.jsonl` and `no_proposal_records` in progress/summary files.
 
 ### Round Size
 
@@ -160,8 +241,8 @@ Current CEPR measures:
 4. **Hard gates reduce reward hacking**
    - A candidate should not be accepted just because it has high prompt similarity if it destroys the source image.
 
-5. **Weighted SFT is practical under deadline**
-   - DPO/PPO would be more complex and riskier to stabilize for a diffusion editor. Weighted SFT is easier to run and debug.
+5. **Preference learning avoids direct imitation of failures**
+   - Accepted-only SFT starves hard object edits, while rejected-image SFT teaches failures. The current method uses internal same-group preferences and suppresses SFT anchoring for near-miss failures.
 
 ## What Is Implemented Beyond Training
 
@@ -674,3 +755,72 @@ The current implementation is a functioning self-evolve system with trainable pr
 The current weakness is reward alignment. CEPR is internally principled but not explicit enough for hard semantic edit verification. The next credible solution is **Internal Rubric CEPR**: keep rewards internal, but use Qwen-Image-Edit's own understanding path to answer structured source/edit/preservation questions and combine those answers with existing VAE preservation checks.
 
 This is the most defensible path to improving benchmark performance while preserving the project's internal-reward novelty.
+
+## Latest Implementation Direction: Conservative Pairwise Self-Evolution
+
+The current code/config now implements a stronger no-harm preference pipeline:
+
+- `candidate_generation.reference_candidates` generates one `reference:base` candidate per proposal from the initial Qwen editor state.
+- `training.preference.base_relative` compares policy candidates against that base/reference candidate.
+- Policy candidates are chosen only when they beat the base by margin; if base wins, the pair is reversed and used as a no-harm preference.
+- Ambiguous base-vs-policy comparisons are skipped by default.
+- Constraint-aware pair scoring prioritizes CEPR/rubric preservation and validity, with internal VLM only as an agreement/weighting signal.
+- `training.preference.vlm_pair_guard` confidence-weights pairs and can reject VLM-disagreeing pairs.
+- `output.use_cumulative_preference_manifest=true` replays previous high-confidence preference pairs across rounds.
+- Proposer SFT now records policy-over-base margins and can reward useful base-improving proposal distributions.
+
+Primary patched config:
+
+```bash
+configs/self_evolve/qwen_edit_2509_balanced_cepr_v2.yaml
+```
+
+The config now writes to:
+
+```bash
+outputs/self_evolve/qwen_edit_2509_conservative_pairwise_v1
+```
+
+Run only inside a Slurm allocation/tmux resource session using the `qedit` environment.
+
+## Latest State: 2026-06-02
+
+Active diagnostic run:
+
+- tmux: `uug_balanced_v2`
+- Slurm job: `504`
+- output root: `outputs/self_evolve/balanced_cepr_v2_selfplay_margin_diag48_r4_20260602T095235Z`
+- method: closed-loop editor/proposer self-play with internal CEPR/rubric reward and pairwise diffusion preference training.
+
+Current findings:
+
+- Round 1 improved ImgEdit 32-canary by `+0.0834`, but regressed GEdit subject-replace/cn 32-canary by `-0.2480` overall.
+- Round 2 had only one accepted candidate and mostly near-miss preference pairs.
+- Failure audit showed object removal/replacement candidates had decent raw CEPR scores but failed the stricter rubric gates, especially `rubric_forbidden_after_absent` and `rubric_edit_success`.
+
+Code/config fix for future clean runs:
+
+- `src/qwen_edit_project/self_evolve/loop.py` now supports `training.preference.near_miss_contract_filter`.
+- `configs/self_evolve/qwen_edit_2509_balanced_cepr_v2.yaml` enables that filter for local edit types so failed object/spatial/local edits cannot become chosen near-miss preference positives.
+- `src/qwen_edit_project/self_evolve/backends.py` also has deterministic scheduled-edit fallback templates for non-object edit types; active v2 will not pick this up until a new process starts.
+
+Recommended next run:
+
+- Start a clean v3 diagnostic after current evals finish, using the patched source and a fresh output root.
+- Keep `include_rejected=false`; keep pairwise preference learning; use enough records/candidates to compensate for the stricter near-miss filter.
+
+Current replacement run:
+
+- tmux: `uug_balanced_v2`
+- output root: `outputs/self_evolve/balanced_cepr_v4_anchor_contract_diag96_r4_20260602T114756Z`
+- reason: v2/v3 showed object edits could fail but still create noisy near-miss preferences; v4 uses anchored object target regions and a strict near-miss contract.
+- early signal: object removal/replacement are still rejected, but attribute/material groups are accepted, so the run is cleaner and not fully starved.
+
+Current eval:
+
+- tmux: `uug_cepr_nearmiss`
+- ImgEdit 32-canary for the same checkpoint was positive: `+0.0934375` over baseline.
+- GEdit subject-replace/cn 32-canary was negative: `-0.2681202266795324` overall, so
+  v2 round 2 is not a broad final method.
+- The same tmux is now running `object_prompt_probe_direct_anchor_r1_20260602T122705Z`,
+  an 8-record object-only generation/scoring probe with training disabled.

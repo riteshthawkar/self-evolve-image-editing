@@ -115,13 +115,41 @@ Quality is not allowed to compensate for wrong editing. `Q_i` only rejects unsta
 
 ## Candidate Selection
 
-For each source image and instruction, sample `K` candidates from Qwen-Image-Edit-2509 using the official generation settings. Accept only the top feasible candidate:
+For each source image and instruction, sample `K` candidates from the current
+Qwen-Image-Edit checkpoint using the official generation settings. Accept only the top feasible
+candidate:
 
 ```text
 y* = argmax_i R(y_i | x, c)
 ```
 
 This turns self-evolution into constrained candidate selection: the model trains only on edits that are both instruction-specific and preservation-safe.
+
+## Preference Learning
+
+The main self-evolution path now trains the editor from internal preference pairs rather than direct
+weighted SFT targets. For each proposal group:
+
+```text
+chosen = highest-ranked accepted CEPR candidate
+rejected = lower-ranked candidate from the same group
+```
+
+The loop writes these pairs to `preference_manifest.jsonl` and launches the Diffusers LoRA trainer
+with `pairwise_linear_sdpo`. This keeps the supervision internal and relative: the model is not told
+that a generated image is an absolute target, only that one of its own candidates is preferable to
+another candidate under CEPR.
+
+The CEPR-weighted SFT manifest is still written for diagnostics and ablations, but the main
+trainable-proposer configs disable rejected-image SFT targets.
+
+When no candidate passes the hard accept gates, the loop can still form a near-miss pair if the best
+candidate clears raw internal reward, semantic-edit, preservation, and validity floors. These pairs
+use CEPR raw reward for within-group ranking and carry lower sample weight. They set
+`chosen_is_near_miss=true` and `preference_sft_weight=0.0`, so the editor learns only the relative
+ordering between two self-generated candidates. This is important for object removal/replacement,
+where accepted positives are sparse but failed candidates still expose the boundary between "closer
+to the requested edit" and "worse failure."
 
 ## Main Command
 

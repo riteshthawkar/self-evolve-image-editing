@@ -6,7 +6,10 @@ import hashlib
 import io
 import json
 import math
+import os
+import sys
 import time
+import traceback
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -483,4 +486,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exc:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        code = exc.code if isinstance(exc.code, int) else 1
+        os._exit(code)
+    except BaseException:
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

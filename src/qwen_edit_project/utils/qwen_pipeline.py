@@ -40,6 +40,7 @@ def load_qwen_edit_pipeline(
     backend: str = "diffsynth",
     base_model: str | None = None,
     local_files_only: bool = False,
+    lora_scale: float | None = None,
 ):
     if backend in {"diffusers", "official_diffusers", "qwen_edit_plus"}:
         return load_qwen_edit_plus_pipeline(
@@ -49,6 +50,7 @@ def load_qwen_edit_pipeline(
             device=device,
             torch_dtype=torch_dtype,
             local_files_only=local_files_only,
+            lora_scale=lora_scale,
         )
 
     torch, load_state_dict, ModelConfig, QwenImagePipeline = _load_diffsynth_modules()
@@ -104,6 +106,7 @@ def load_qwen_edit_plus_pipeline(
     device: str = "auto",
     torch_dtype: str | None = "auto",
     local_files_only: bool = False,
+    lora_scale: float | None = None,
 ):
     import torch
 
@@ -127,7 +130,10 @@ def load_qwen_edit_plus_pipeline(
     resolved_checkpoint = resolve_path(checkpoint_path) if checkpoint_path else None
     if resolved_checkpoint is not None:
         if model_type == "lora" and hasattr(pipe, "load_lora_weights"):
-            pipe.load_lora_weights(str(resolved_checkpoint))
+            adapter_name = "qedit_lora"
+            pipe.load_lora_weights(str(resolved_checkpoint), adapter_name=adapter_name)
+            if lora_scale is not None and hasattr(pipe, "set_adapters"):
+                pipe.set_adapters(adapter_name, adapter_weights=float(lora_scale))
         else:
             raise ValueError(
                 "The official Diffusers QwenImageEditPlusPipeline backend is only validated for "

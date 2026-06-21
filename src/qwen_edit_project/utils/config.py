@@ -60,6 +60,9 @@ def parse_override(raw: str) -> tuple[str, Any]:
                 break
             except ValueError:
                 parsed = value
-        if isinstance(parsed, str) and parsed.startswith("[") and parsed.endswith("]"):
+        if isinstance(parsed, str) and (
+            (parsed.startswith("[") and parsed.endswith("]"))
+            or (parsed.startswith("{") and parsed.endswith("}"))
+        ):
             parsed = json.loads(parsed)
     return key, parsed
