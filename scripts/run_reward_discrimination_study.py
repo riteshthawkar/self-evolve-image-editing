@@ -283,11 +283,21 @@ def main() -> int:
         action="store_false",
         help="Disable the skip-infeasible judge optimization (judge every candidate, much slower).",
     )
+    parser.add_argument(
+        "--set",
+        dest="set_overrides",
+        action="append",
+        default=[],
+        metavar="evaluator.key=value",
+        help="Override an evaluator-config key (dotted, relative to the `evaluator` block). "
+        "Repeatable. Used by the ablation matrix to knock out one gate per run.",
+    )
     parser.set_defaults(fast_judge=True)
     args = parser.parse_args()
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     from qwen_edit_project.self_evolve.backends import InternalRubricCEPREvaluator
+    from qwen_edit_project.utils.config import merge_override, parse_override
 
     evaluator_config: dict[str, Any] = {}
     if args.evaluator_config:
@@ -310,6 +320,16 @@ def main() -> int:
             f"fast_judge={args.fast_judge}",
             flush=True,
         )
+
+    # Ablation overrides: dotted keys relative to the `evaluator` block, e.g.
+    #   --set conservative_region_reward_enabled=false
+    #   --set internal_vlm_judge.enabled=false
+    # This lets the ablation matrix knock out one gate per run without cloning configs.
+    for raw in args.set_overrides:
+        key, value = parse_override(raw)
+        evaluator_config = merge_override(evaluator_config, key, value)
+    if args.set_overrides:
+        print(f"Applied {len(args.set_overrides)} ablation override(s): {args.set_overrides}", flush=True)
 
     probe_dir = Path(args.probe_dir)
     manifest_path = probe_dir / "manifest.jsonl"

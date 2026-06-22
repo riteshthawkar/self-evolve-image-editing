@@ -240,3 +240,61 @@ PYTHONPATH=src .venv_reward/bin/python scripts/run_reward_discrimination_study.p
 Environment: overlay venv `.venv_reward`
 (`python -m venv --system-site-packages`, then diffusers 0.38.0 +
 transformers 4.57.6) on top of the base CUDA torch 2.7.1+cu126.
+
+## Reward-component ablation matrix (answers the "engineered reward" critique)
+
+A reviewer can fairly ask whether a multi-gate reward is an *engineered* score
+with no research content. The defensible claim is the opposite: **each component
+is tied to a measured failure it prevents.** The ablation matrix makes that
+claim falsifiable — remove one component and show the cost is either a
+*false-accept* (a negative class gets accepted) or a *recall* loss (good edits
+get rejected), never "no change."
+
+All arms run on the **free 24 GB GPU** via the reward-only harness
+(transformer skipped); they do **not** need the experiment machine. Each arm
+knocks out exactly one component via `--set` overrides.
+
+| Arm | Knock-out | What it tests / expected effect |
+|---|---|---|
+| `A0_embedding_only` | all gates off (lean default) | Gameable baseline. Embedding similarity alone → high false-accepts, AUC good-vs-noop ≈ 0.13. |
+| `A1_full_production` | none (reference) | The production reward. Expect **0 false-accepts**, good recall ≈ 0.32. |
+| `A2_no_rubric_forbidden` | `rubric_forbidden_threshold=0` | Removes the "old state must be gone" gate. Expect residual-object / no-op leakage on removal/replacement. |
+| `A3_no_conservative` | `conservative_region_reward_enabled=false` | Expect **no-ops to leak back in** (the gate's target-change sub-gate is what catches them) → proves it is load-bearing, not decoration. |
+| `A4_no_object_detector` | `object_detector_enabled=false` | Removes grounded verification on removal/replacement. Expect false-accepts or recall loss on those two types. |
+| `A5_no_vlm_judge` | `internal_vlm_judge.enabled=false` | Isolates the judge's marginal contribution to both false-accept suppression and recall. |
+| `A6_conservative_relax_outside` | raise `max_outside_change` / `max_outside_changed_fraction`, drop outside-preservation floors; **keep target-change** | The surgical fix. Expect **recall recovery on broad edits WITHOUT a rise in noop acceptance** — the headline that the two-sub-gate analysis predicts. |
+
+**Metrics per arm** (already emitted by the harness `overall` block, aggregated
+by `summarize_reward_ablation.py`):
+
+- `good_accept` — recall (higher is better).
+- `noop_accept` / `corrupt_accept` / `wrong_accept` — **false-accept rates; must
+  stay 0.000.** Any non-zero value on a removed component is direct evidence that
+  the component was preventing reward hacking.
+- `AUC good-vs-{noop,corrupt,wrong}` — separation of the raw reward.
+
+The reviewer-facing result is a single table where **A1 holds 0 false-accepts**,
+each `A2…A5` either breaks that or drops recall, and **A6 lifts recall with
+no-op acceptance still at 0** — i.e. every gate earns its place and the residual
+recall headroom has a safe, characterized fix.
+
+```bash
+# full matrix (overnight; reward-only, no experiment GPU)
+scripts/run_reward_ablation_matrix.sh
+
+# quick subset to validate the harness (5 pairs/type)
+LIMIT=5 scripts/run_reward_ablation_matrix.sh
+
+# a single arm
+ARMS="A3_no_conservative" scripts/run_reward_ablation_matrix.sh
+
+# aggregate any finished arms into the comparison table
+PYTHONPATH=src python scripts/summarize_reward_ablation.py \
+  --arms-root outputs/analysis/reward_ablation
+```
+
+> End-to-end caveat: the offline matrix shows the reward *decision geometry*.
+> The strongest reviewer evidence is still the **A/B training run** (embedding-CEPR
+> vs structured-CEPR self-evolve loop) showing the embedding reward collapses
+> (reward ↑, held-out edit quality ↓) while the structured reward does not — run
+> that once the experiment machine is back.
