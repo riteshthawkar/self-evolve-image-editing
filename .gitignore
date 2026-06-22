@@ -19,6 +19,7 @@ data/raw/*
 !data/raw/.gitkeep
 data/downloads/
 data/edit_pairs/
+data/probe/
 data/manifests/*
 !data/manifests/.gitkeep
 data/unlabeled/*

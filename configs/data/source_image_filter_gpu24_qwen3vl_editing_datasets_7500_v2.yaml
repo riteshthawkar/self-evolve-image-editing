@@ -1,0 +1,78 @@
+name: source_image_filter_gpu24_qwen3vl_editing_datasets_7500_v2
+# v2 rationale (validated offline on the 5k audit judgments):
+#   - Scan the full 7500-image raw pool (source: directory) instead of the 5k heuristic subset.
+#   - Removal-suitability is now a *soft* bonus (kept in weights) instead of three hard gates,
+#     because over half of natural editable images are great replace/add/style targets yet have
+#     low "removable secondary object" scores. Removing those gates lifts acceptance 62% -> ~81%.
+#   - Saturated axes (quality/natural/clarity) are down-weighted so the discriminative axes
+#     (editable_content, preservation_potential, object_region_clarity) drive the ranking.
+#   - min_total_score 0.66 keeps real selection pressure (rejects the bottom ~20%).
+#   Offline projection @7500: ~6046 accepted/selected -> comfortably above the 5k target.
+input:
+  source: directory
+  images_dir: data/unlabeled/raw
+vlm:
+  backend: qwen_vl
+  model_id: Qwen/Qwen3-VL-8B-Instruct
+  device: cuda:0
+  torch_dtype: float16
+  max_new_tokens: 256
+  temperature: 0.0
+  padding_side: left
+  processor_max_pixels: 131072
+selection:
+  max_selected: 6000
+  min_average_hash_distance: 4
+  max_family_fraction: 0.80
+  target_family_fractions:
+    object: 0.60
+    background: 0.25
+    color: 0.15
+  primary_family_priority:
+    - object
+    - background
+    - color
+  family_thresholds:
+    object:
+      min_object_region_clarity: 0.55
+      min_editable_content_score: 0.62
+      min_removable_object_score: 0.30
+      min_small_object_separability: 0.30
+      min_removal_background_fill_score: 0.30
+  batch_size: 4
+  progress_every: 20
+  resume_scored: true
+  stream_scores: true
+  thresholds:
+    min_short_side: 384
+    max_aspect_ratio: 2.6
+    min_technical_quality: 0.42
+    min_vlm_quality: 0.55
+    min_natural_image: 0.55
+    min_editable_content: 0.62
+    min_object_region_clarity: 0.52
+    min_preservation_potential: 0.58
+    min_edit_families: 1
+    max_clutter_penalty: 0.68
+    max_text_watermark_penalty: 0.25
+    min_total_score: 0.66
+  weights:
+    technical_quality: 0.12
+    vlm_quality: 0.08
+    natural_image: 0.10
+    editable_content: 0.20
+    object_region_clarity: 0.14
+    removable_object_score: 0.06
+    small_object_separability: 0.05
+    removal_background_fill_score: 0.05
+    preservation_potential: 0.16
+    edit_family_coverage: 0.10
+    clutter_penalty: 0.10
+    text_watermark_penalty: 0.12
+output:
+  selected_manifest_jsonl: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_7500_v2/manifest.jsonl
+  rejected_manifest_jsonl: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_7500_v2/rejected.jsonl
+  score_jsonl: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_7500_v2/scores.jsonl
+  summary_json: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_7500_v2/selection_summary.json
+  materialize_mode: none
+  selected_images_dir: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_7500_v2/images
