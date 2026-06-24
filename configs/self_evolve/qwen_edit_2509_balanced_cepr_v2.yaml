@@ -6,7 +6,7 @@ runtime:
   release_proposer_before_generation: false
 dataset:
   source: jsonl
-  manifest_jsonl: data/unlabeled/selected/magicbrush_all_images_moe/manifest_balanced_object_color_background_rounds256.jsonl
+  manifest_jsonl: data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_7500_v2/manifest.jsonl
   metadata_jsonl: null
   limit: null
 proposer:

@@ -30,24 +30,40 @@ collapse comparison; run it second (or on a second allocation).
 - [x] Ablation matrix running on the **free 24 GB GPU** (independent of the
       experiment machine); does not block the launch.
 
-## 2. Data dependency — **(BLOCKER)**
+## 2. Data dependency — **(transfer via HF, not git)**
 
-The active config points at a MagicBrush-derived manifest:
+The active config now points at an **included, verified** manifest:
 
 ```text
 dataset.manifest_jsonl:
-  data/unlabeled/selected/magicbrush_all_images_moe/manifest_balanced_object_color_background_rounds256.jsonl
+  data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_7500_v2/manifest.jsonl   # 5588 records
 ```
 
-- [ ] **This file is gitignored (`data/unlabeled/*`) and is NOT pushed.** It must
-      exist on the experiment machine before launch. Options:
-  - Prepare it on the remote: `bash scripts/prepare_magicbrush.sh`
-    (and/or `scripts/prepare_remote_data.sh`), then confirm the path resolves; **or**
-  - Override at launch to an already-present manifest, e.g.:
-    `--set dataset.manifest_jsonl=data/unlabeled/selected/<available>/manifest.jsonl`
-- [ ] Confirm the manifest has enough records for the planned rounds
-      (`curriculum.max_records_per_round` × `curriculum.num_rounds`).
-- [ ] Source images referenced by the manifest are readable on the remote FS.
+`data/**` is gitignored, so it does NOT transfer via git. The whole
+`data/unlabeled/` tree (raw images + manifests, 1.1 GB) is shipped as a single
+zip via Hugging Face:
+
+- **Local file to push:** `/home/fahadkhan/ritesh/self_evolve_data_unlabeled.zip`
+- **Push:**
+  ```bash
+  huggingface-cli upload <user>/self-evolve-data \
+    /home/fahadkhan/ritesh/self_evolve_data_unlabeled.zip \
+    self_evolve_data_unlabeled.zip --repo-type dataset
+  ```
+- **Pull + extract at the repo ROOT** (paths inside the manifests are relative,
+  e.g. `data/unlabeled/raw/...`, so the zip must land directly under the repo root):
+  ```bash
+  cd <repo>/self-evolve-image-editing
+  huggingface-cli download <user>/self-evolve-data \
+    self_evolve_data_unlabeled.zip --repo-type dataset --local-dir .
+  unzip -q self_evolve_data_unlabeled.zip   # recreates ./data/unlabeled/
+  ls data/unlabeled/selected/               # verify
+  ```
+
+- [ ] Zip extracted at repo root; `data/unlabeled/selected/editing_datasets_qwen3vl_gpu24_7500_v2/manifest.jsonl` resolves.
+- [ ] Source images referenced by the manifest are readable on the remote FS
+      (all refs verified 0-missing locally before zipping).
+- [ ] (Alternate manifests in the same zip if needed: `editing_datasets_qwen3vl_gpu24_5k_audit_v1` (3018, quality-audited), `editing_datasets_heuristic_hq_5k_v1` (5000).)
 
 ## 3. Environment / machine — **(BLOCKER if env missing)**
 
@@ -120,11 +136,11 @@ Then on the experiment machine:
 git fetch origin
 git checkout codex/local-vlm-data-audit
 git pull
-# then resolve §2 (data) and §3 (env) before launching
+# then download+extract the data zip (§2) and resolve §3 (env) before launching
 ```
 
-> Note: data (`data/**`), `.venv_reward/`, and `outputs/analysis/**` are
-> gitignored and will NOT transfer via git. Prepare data on the remote per §2.
+> Note: `data/**`, `.venv_reward/`, and `outputs/analysis/**` are gitignored and
+> do NOT transfer via git. The data ships as a Hugging Face zip — see §2.
 
 ## 7. The control arm (B-embedding) — strongest reviewer evidence
 
