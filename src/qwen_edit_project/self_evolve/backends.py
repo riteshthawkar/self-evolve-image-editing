@@ -3005,6 +3005,12 @@ class InternalRubricCEPREvaluator(InternalContrastiveEditPreservationEvaluator):
         self.internal_vlm_judge_cfg = dict(judge_cfg) if isinstance(judge_cfg, dict) else {}
         self.internal_vlm_judge_enabled = bool(self.internal_vlm_judge_cfg.get("enabled", False))
         self.internal_vlm_judge_max_candidates = int(self.internal_vlm_judge_cfg.get("max_candidates", 8))
+        # Opt-in: skip the (expensive) judge on candidates already rejected by cheaper gates.
+        # The judge with require_for_feasible can only remove feasibility, never grant it, so
+        # skipping already-infeasible candidates leaves every accept/reject decision unchanged.
+        self.internal_vlm_judge_skip_infeasible = bool(
+            self.internal_vlm_judge_cfg.get("skip_infeasible", False)
+        )
         self.internal_vlm_judge_image_resolution = int(self.internal_vlm_judge_cfg.get("image_resolution", 384))
         self.internal_vlm_judge_max_new_tokens = int(self.internal_vlm_judge_cfg.get("max_new_tokens", 768))
         self.internal_vlm_judge_temperature = float(self.internal_vlm_judge_cfg.get("temperature", 0.0))
@@ -3499,6 +3505,7 @@ class InternalRubricCEPREvaluator(InternalContrastiveEditPreservationEvaluator):
             (int(row["candidate_index"]), edited_candidates[int(row["candidate_index"])])
             for row in candidate_rows
             if 0 <= int(row["candidate_index"]) < len(edited_candidates)
+            and (not self.internal_vlm_judge_skip_infeasible or row.get("feasible"))
         ]
         if not candidate_items:
             return
@@ -3536,6 +3543,10 @@ class InternalRubricCEPREvaluator(InternalContrastiveEditPreservationEvaluator):
         edit_type = str(spec.get("edit_type", "local_enhancement"))
         for row in rows:
             candidate_index = int(row["candidate_index"])
+            if self.internal_vlm_judge_skip_infeasible and not row.get("feasible"):
+                # Already rejected by a cheaper gate; the judge was intentionally not run for it.
+                # Leave its existing feasibility/reward/reject_reason untouched.
+                continue
             signals = row.setdefault("signals", {})
             component_scores = row.setdefault("component_scores", {})
             if candidate_index not in judge_scores:
