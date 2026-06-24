@@ -27,8 +27,7 @@ data/external/*
 !data/external/.gitkeep
 data/processed/*
 !data/processed/train/
-!data/processed/val/
-!data/processed/benchmark/
+!data/processed/val/!data/processed/benchmark/
 !data/processed/train/.gitkeep
 !data/processed/val/.gitkeep
 !data/processed/benchmark/gedit/
@@ -67,3 +66,7 @@ outputs/presentations/*
 outputs/quick_eval/
 outputs/self_evolve/*
 outputs/*.pdf
+
+# Large local data bundle (shipped via Hugging Face, not git)
+self_evolve_data_unlabeled.zip
+*.zip
