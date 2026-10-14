@@ -1,5 +1,9 @@
 # Qwen-Image-Edit Baseline Framework
 
+On branch `migration/source-path-v1`, follow [MIGRATION.md](MIGRATION.md) to run
+the current standalone source-path diagnostic on the new dedicated GPU machine.
+Its code is in [revisable-image-editing/experiments/source_path_diagnostic_v1/](revisable-image-editing/experiments/source_path_diagnostic_v1/README.md).
+
 This repo contains the baseline research codebase for finetuning and evaluating `Qwen/Qwen-Image-Edit-2509`.
 
 The baseline is intentionally limited to:
